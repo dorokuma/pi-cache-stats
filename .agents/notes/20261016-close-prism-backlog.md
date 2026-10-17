@@ -38,3 +38,7 @@ supersedes: "20261004-pi-ext-sync-install-script.md" # 条款级：仅闭合其�
 - 关联旧笔记：`.agents/notes/20261004-pi-ext-sync-install-script.md:44`
 - 关联外部证据：`/root/workspace/pi-extensions` 提交 `21411bd` 及笔记 `.agents/notes/20261016-remove-prism-extension.md`、全局台账 `/root/workspace/PROJECTS.md:42`
 - 任务标记：`[MARK-PRISM-BACKLOG-20261016]`；工作分支：`chore/close-prism-backlog`
+
+## 勘误（2026-10-16，去重轮后补）
+
+- 2026-10-16 晚间的去重轮（commit `296ebb3`）对旧笔记 `.agents/notes/20261004-pi-ext-sync-install-script.md` 做了就地行内替换（frontmatter `superseded_by`、第 41/45/49-50 行加 `[本仓特有]` 标注与指针），本笔记原「原样不改/严禁修改」表述（第 12 行「旧笔记文件按不可篡改历史规范保持原样不改」、第 19 行「严禁修改 `.agents/notes/20261004-pi-ext-sync-install-script.md` 文件本身」及第 28 行同类表述）仅代表本闭合笔记落盘当时的约束，不适用于后续独立授权的去重轮；旧笔记中 prism 相关条目（第 42-44 行，尤其 `:44` 的 `prism.ts` 手工同步表述）未在去重轮中改动，本笔记对 `:42-44`/`:44` 的行号引用仍有效。

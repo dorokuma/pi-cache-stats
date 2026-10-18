@@ -6,9 +6,9 @@ import { pathToFileURL } from "node:url";
 import { loadSdk, promptThrough, registerFactory, runnerFor, isolateCacheEnv } from "./helpers.mjs";
 
 isolateCacheEnv();
-process.env.PI_CACHE_GUARD_FOOTER = "0";
+process.env.PI_CACHE_STATS_FOOTER = "0";
 
-const { default: guardianFactory } = await import("../extensions/cache-guardian.ts");
+const { default: guardianFactory } = await import("../extensions/cache-stats.ts");
 const loaded = await loadSdk();
 const {
   ExtensionRunner,

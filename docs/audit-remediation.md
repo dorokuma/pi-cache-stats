@@ -1,5 +1,7 @@
 # 审计整改映射（F01–F12）
 
+> **注（1.5.0+）**：自 1.5.0 起项目更名为 `pi-cache-stats`（扩展入口 `extensions/cache-stats.ts`、命令 `/cache-stats`、环境变量前缀 `PI_CACHE_STATS_`），并移除了可选技能精简、旧 retention 剥离、低命中率告警与首轮 prompt 字符统计等特性。下文保留历史审计整改时的原始记述，不作重写。
+
 对照仓库 `1.2.7` / `244e8c7` 的审计结论，以及主代理已采纳的复核限定。原始证据在 `/tmp/pi-cache-guardian-audit-244e8c7/`（只读历史，不是正确性权威）。**未把未测条件写成已部署事故。** 本仓库安装副本 `~/.pi/agent/extensions/cache-guardian.ts` 不在本次修改范围内。
 
 ## 已采纳的审计修正

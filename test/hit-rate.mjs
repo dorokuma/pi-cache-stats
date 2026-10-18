@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { cacheHitDenom, cacheHitPct, aggregateHit, normalizeUsage, computeLiveHitRates, formatTps } from "../extensions/cache-guardian.ts";
+import { cacheHitDenom, cacheHitPct, aggregateHit, normalizeUsage, computeLiveHitRates, formatTps } from "../extensions/cache-stats.ts";
 import { isolateCacheEnv } from "./helpers.mjs";
 
 isolateCacheEnv();
@@ -103,7 +103,7 @@ isolateCacheEnv();
 
 // 7. Footer formatting & truncation verification
 import { visibleWidth, stripTerminalSequences } from "@earendil-works/pi-tui";
-import { truncateFooter, formatHerdsmanStatus, formatWindowSize } from "../extensions/cache-guardian.ts";
+import { truncateFooter, formatHerdsmanStatus, formatWindowSize } from "../extensions/cache-stats.ts";
 
 {
   // 7a. formatWindowSize tests
@@ -192,7 +192,7 @@ import { truncateFooter, formatHerdsmanStatus, formatWindowSize } from "../exten
   assert.equal(truncateFooter("", 10, dummyTheme), "");
 
   // Plain string fallback
-  const plain = "Hello world from cache-guardian footer";
+  const plain = "Hello world from cache-stats footer";
   const res = truncateFooter(plain, 10);
   assert.ok(visibleWidth(res) <= 10);
   assert.ok(stripTerminalSequences(res).endsWith("…") || stripTerminalSequences(res).endsWith("..."));

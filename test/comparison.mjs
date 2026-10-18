@@ -5,16 +5,15 @@
  * extensions, credentials, or call a model API.
  *
  * Real network benchmark (optional, explicit):
- *   PI_CACHE_GUARD_BENCH=1 PI_CACHE_GUARD_BENCH_PROVIDER=... PI_CACHE_GUARD_BENCH_MODEL=... node test/comparison.mjs
+ *   PI_CACHE_STATS_BENCH=1 PI_CACHE_STATS_BENCH_PROVIDER=... PI_CACHE_STATS_BENCH_MODEL=... node test/comparison.mjs
  *
- * Costs, if printed, are estimates from PI_CACHE_GUARD_BENCH_PRICE_* and are
+ * Costs, if printed, are estimates from PI_CACHE_STATS_BENCH_PRICE_* and are
  * not a provider bill. Missing, blank, NaN, or non-finite prices yield null
  * (not estimable); an explicit 0 is a valid price. Cache hit-rate denominator
  * is input + cacheRead + cacheWrite only (output is excluded).
  *
  * Network arms always run default observation mode (inherited PI_CACHE_* is
- * cleared; noSkills: true). They cannot quantify SKILL_COMPACT /
- * STRIP_RETENTION / retention changes.
+ * cleared; noSkills: true).
  */
 import { strict as assert } from "node:assert";
 import fs from "node:fs";
@@ -260,16 +259,16 @@ async function runOfflineSelfCheck() {
 }
 
 async function runNetworkBench() {
-  const provider = process.env.PI_CACHE_GUARD_BENCH_PROVIDER;
-  const modelId = process.env.PI_CACHE_GUARD_BENCH_MODEL;
+  const provider = process.env.PI_CACHE_STATS_BENCH_PROVIDER;
+  const modelId = process.env.PI_CACHE_STATS_BENCH_MODEL;
   if (!provider || !modelId) {
-    throw new Error("PI_CACHE_GUARD_BENCH=1 requires PI_CACHE_GUARD_BENCH_PROVIDER and PI_CACHE_GUARD_BENCH_MODEL");
+    throw new Error("PI_CACHE_STATS_BENCH=1 requires PI_CACHE_STATS_BENCH_PROVIDER and PI_CACHE_STATS_BENCH_MODEL");
   }
-  const agentDir = process.env.PI_CACHE_GUARD_BENCH_AGENT_DIR;
+  const agentDir = process.env.PI_CACHE_STATS_BENCH_AGENT_DIR;
   if (!agentDir) {
-    throw new Error("PI_CACHE_GUARD_BENCH=1 requires PI_CACHE_GUARD_BENCH_AGENT_DIR (explicit, never default ~/.pi/agent)");
+    throw new Error("PI_CACHE_STATS_BENCH=1 requires PI_CACHE_STATS_BENCH_AGENT_DIR (explicit, never default ~/.pi/agent)");
   }
-  const cwd = process.env.PI_CACHE_GUARD_BENCH_CWD ?? fs.mkdtempSync(path.join(os.tmpdir(), "guardian-fix-bench-"));
+  const cwd = process.env.PI_CACHE_STATS_BENCH_CWD ?? fs.mkdtempSync(path.join(os.tmpdir(), "guardian-fix-bench-"));
   const { default: extFactory } = await import(pathToFileURL(GUARDIAN_PATH).href);
   const modelRuntime = await ModelRuntime.create({
     authPath: path.join(agentDir, "auth.json"),
@@ -313,18 +312,18 @@ async function runNetworkBench() {
     return print(label, results);
   }
 
-  const order = process.env.PI_CACHE_GUARD_BENCH_ORDER === "BA" ? ["WITH", "WITHOUT"] : ["WITHOUT", "WITH"];
+  const order = process.env.PI_CACHE_STATS_BENCH_ORDER === "BA" ? ["WITH", "WITHOUT"] : ["WITHOUT", "WITH"];
   const arms = {};
   for (const label of order) {
     arms[label] = await runArm(label, label === "WITH" ? [extFactory] : []);
   }
   const prices = {
-    inputPerMillion: parseBenchPrice(process.env.PI_CACHE_GUARD_BENCH_PRICE_INPUT),
-    outputPerMillion: parseBenchPrice(process.env.PI_CACHE_GUARD_BENCH_PRICE_OUTPUT),
-    cacheReadPerMillion: parseBenchPrice(process.env.PI_CACHE_GUARD_BENCH_PRICE_CACHE_READ),
-    cacheWritePerMillion: parseBenchPrice(process.env.PI_CACHE_GUARD_BENCH_PRICE_CACHE_WRITE),
+    inputPerMillion: parseBenchPrice(process.env.PI_CACHE_STATS_BENCH_PRICE_INPUT),
+    outputPerMillion: parseBenchPrice(process.env.PI_CACHE_STATS_BENCH_PRICE_OUTPUT),
+    cacheReadPerMillion: parseBenchPrice(process.env.PI_CACHE_STATS_BENCH_PRICE_CACHE_READ),
+    cacheWritePerMillion: parseBenchPrice(process.env.PI_CACHE_STATS_BENCH_PRICE_CACHE_WRITE),
   };
-  console.log("\nEstimates use PI_CACHE_GUARD_BENCH_PRICE_* and are not a provider bill.");
+  console.log("\nEstimates use PI_CACHE_STATS_BENCH_PRICE_* and are not a provider bill.");
   console.log(JSON.stringify({ order, arms, estimateUsd: {
     WITHOUT: estimateCostUsd(arms.WITHOUT, prices),
     WITH: estimateCostUsd(arms.WITH, prices),
@@ -333,7 +332,7 @@ async function runNetworkBench() {
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  if (process.env.PI_CACHE_GUARD_BENCH === "1") {
+  if (process.env.PI_CACHE_STATS_BENCH === "1") {
     await runNetworkBench();
   } else {
     await runOfflineSelfCheck();

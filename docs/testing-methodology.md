@@ -2,17 +2,17 @@
 
 ## 目的
 
-验证 cache-guardian **不会**为了缓存而丢弃新的系统规则或破坏来源边界，并确认统计口径、启停生命周期和对照脚本隔离。量化“更长缓存前缀 / 更低账单”需要显式网络基准，**不是** `npm test` 的一部分。
+验证 cache-stats **不会**为了缓存而丢弃新的系统规则或破坏来源边界，并确认统计口径、启停生命周期和对照脚本隔离。量化“更长缓存前缀 / 更低账单”需要显式网络基准，**不是** `npm test` 的一部分。
 
 ## 离线回归（`npm test`）
 
 | 文件 | 覆盖 |
 |------|------|
-| `test/cache-guardian.mjs` | 真实加载扩展并驱动 Pi `ExtensionRunner` 事件：同会话新规则、前后扩展顺序、project_instructions、技能默认透传与 opt-in 无损精简、400 不改策略、不注入 key、多实例 3 轮交错、disable/enable/reset/footer、导入不改 env、244e8c7 旧版冻结对照 |
+| `test/cache-stats.mjs` | 真实加载扩展并驱动 Pi `ExtensionRunner` 事件：同会话新规则、前后扩展顺序、project_instructions、技能默认透传、400 不改策略、不注入 key、多实例 3 轮交错、disable/enable/reset/footer、导入不改 env |
 | `test/hit-rate.mjs` | 净输入命中率公式、footer 纯函数 |
-| `test/agent-session.mjs` | 隔离 `agentDir` 的真实 `createAgentSession`：`setActiveToolsByName` 重建 system prompt，再交给 guardian；禁止默认加载用户扩展；拦截 `fetch` |
+| `test/agent-session.mjs` | 隔离 `agentDir` 的真实 `createAgentSession`：`setActiveToolsByName` 重建 system prompt，再交给 cache-stats；禁止默认加载用户扩展；拦截 `fetch` |
 | `test/comparison.mjs` | 默认只做离线自检：`noExtensions` 隔离、全 assistant usage 累计（含 output，缺省为 0）、缺失 usage/模型即失败、AB/BA 顺序、有限价格校验、每臂独立 in-memory settings 不串扰。命中率分母不含 output |
-| `test/prefix-diagnostics.mjs` | 真实加载扩展并调用注册 handler：默认只读（identity/字段/环境不变）、同 scope 首次/相同/变化、工具顺序、未知/缺失/异常/超限、实例会话模型 endpoint 隔离、开关/reset/淘汰、隐私哨兵、OpenAI chat/Responses/Anthropic 结构、精简开启时元数据与额外说明仍保留。不是缓存命中或省钱证据 |
+| `test/prefix-diagnostics.mjs` | 真实加载扩展并调用注册 handler：默认只读（identity/字段/环境不变）、同 scope 首次/相同/变化、工具顺序、未知/缺失/异常/超限、实例会话模型 endpoint 隔离、开关/reset/淘汰、隐私哨兵、OpenAI chat/Responses/Anthropic 结构。不是缓存命中或省钱证据 |
 | `test/prefix-r9-accessors.mjs` | 不可信 payload：不求值会改字段/计数的 getter、抛错 getter、嵌套与数组下标访问器；识别 Proxy 且不跑陷阱；不执行自定义 iterator/toJSON。非目标 role 不读 content。三种请求结构仍有 baseline→stable→changed 正对照。测试自身不用 JSON.stringify/deepEqual 去触发访问器 |
 | `test/prefix-r9-endpoint.mjs` | 同 provider/API/model/session 下，同域名不同 API 路径与 query 路由各自 baseline/stable，切回不受另一条影响；端口/协议隔离；超长或非字符串 scope 跳过且不合并成空 key；展示中无 URL/query/session 哨兵 |
 | `test/prefix-r9-budget.mjs` | 单个超长 schema 字段名、多项合法但累计超限的字段名、超长值、深嵌套、大数组均 skipped 且不标 stable；预算内复杂 schema 正对照。有限大小样本，不是内存耗尽实验 |
@@ -31,7 +31,7 @@
 SDK 选择：
 
 - 默认：项目依赖 `@earendil-works/pi-coding-agent`（当前 0.84.2）
-- 显式：`PI_CACHE_GUARD_TEST_SDK=/path/to/package-or-dist`（例如本机 0.85.1 宿主包）。测试不写死本机绝对路径。
+- 显式：`PI_CACHE_STATS_TEST_SDK=/path/to/package-or-dist`（例如本机 0.85.1 宿主包）。测试不写死本机绝对路径。
 
 `npm test` 不读取 `~/.pi/agent`、不使用用户凭证、不调用真实模型 API。
 
@@ -39,27 +39,27 @@ SDK 选择：
 
 模型切换本身不是 system prompt 变化的证据。可复现的宿主路径是**同一会话内工具集变化**（`AgentSession.setActiveToolsByName` 会重建 base system prompt），以及资源发现 / 前序扩展更新 `systemPrompt`。
 
-测试用该重建后的真实 prompt 驱动 guardian，而不是 `model_select` 后再手工换字符串。`session.prompt` 若在鉴权门闸处失败，仍以 host rebuild + runner 路径为证据；若 `before_agent_start` 实际触发，则额外记录 live hook。发送前终止或假 stream 可以，但不能打真实 API。
+测试用该重建后的真实 prompt 驱动 cache-stats，而不是 `model_select` 后再手工换字符串。`session.prompt` 若在鉴权门闸处失败，仍以 host rebuild + runner 路径为证据；若 `before_agent_start` 实际触发，则额外记录 live hook。发送前终止或假 stream 可以，但不能打真实 API。
 
 ## 网络基准（必须显式）
 
 ```bash
-PI_CACHE_GUARD_BENCH=1 \
-PI_CACHE_GUARD_BENCH_PROVIDER=... \
-PI_CACHE_GUARD_BENCH_MODEL=... \
-PI_CACHE_GUARD_BENCH_AGENT_DIR=/explicit/isolated/agent-dir \
-PI_CACHE_GUARD_BENCH_ORDER=AB \
+PI_CACHE_STATS_BENCH=1 \
+PI_CACHE_STATS_BENCH_PROVIDER=... \
+PI_CACHE_STATS_BENCH_MODEL=... \
+PI_CACHE_STATS_BENCH_AGENT_DIR=/explicit/isolated/agent-dir \
+PI_CACHE_STATS_BENCH_ORDER=AB \
 node test/comparison.mjs
 ```
 
 要求：
 
 - 两臂各自隔离 loader / settings / session（每臂独立 `SettingsManager.inMemory`，配置相同），且 `noExtensions: true`、`noSkills: true`、`noContextFiles: true`
-- 入口会清掉继承的 `PI_CACHE_*`（保留显式 SDK / BENCH 变量），因此只能比较**默认观测模式**有/无 guardian；**不能**量化 `SKILL_COMPACT` / `STRIP_RETENTION` / retention 改变的收益。未来若要测 opt-in，需另设受控臂（本轮不实现）
+- 入口会清掉继承的 `PI_CACHE_*`（保留显式 SDK / BENCH 变量），因此只比较**默认观测模式**有/无 cache-stats
 - 累计该轮**全部** assistant `usage`（含 output），失败立即退出，不沿用上一轮数字
 - 模型缺失即失败，不隐式回退
-- 可用 `PI_CACHE_GUARD_BENCH_ORDER=BA` 做交叉
-- 费用只能用 `PI_CACHE_GUARD_BENCH_PRICE_*` 做**估算**，不得写成真实账单。估算计入 input / output / cacheRead / cacheWrite；缓存命中分母只含输入侧（input + cacheRead + cacheWrite），不含 output。缺失、纯空白、NaN、Infinity 价格返回不可估算 `null`，不把未填当成免费零价；显式 `0` 仍可用。没有价格时不强迫联网补价或伪造费用
+- 可用 `PI_CACHE_STATS_BENCH_ORDER=BA` 做交叉
+- 费用只能用 `PI_CACHE_STATS_BENCH_PRICE_*` 做**估算**，不得写成真实账单。估算计入 input / output / cacheRead / cacheWrite；缓存命中分母只含输入侧（input + cacheRead + cacheWrite），不含 output。缺失、纯空白、NaN、Infinity 价格返回不可估算 `null`，不把未填当成免费零价；显式 `0` 仍可用。没有价格时不强迫联网补价或伪造费用
 
 ## 历史 10 轮数字
 

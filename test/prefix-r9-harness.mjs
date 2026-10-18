@@ -10,9 +10,9 @@ import {
   isolateCacheEnv,
 } from "./helpers.mjs";
 
-const CORE_FROM_ENV = process.env.PI_CACHE_GUARD_CORE;
+const CORE_FROM_ENV = process.env.PI_CACHE_STATS_CORE;
 isolateCacheEnv();
-if (CORE_FROM_ENV) process.env.PI_CACHE_GUARD_CORE = CORE_FROM_ENV;
+if (CORE_FROM_ENV) process.env.PI_CACHE_STATS_CORE = CORE_FROM_ENV;
 
 export const SENTINEL = {
   prompt: "PRIV_PROMPT_CANARY_7f3a9c",
@@ -25,7 +25,7 @@ export const SENTINEL = {
 };
 
 export function resolveCorePath() {
-  const explicit = process.env.PI_CACHE_GUARD_CORE;
+  const explicit = process.env.PI_CACHE_STATS_CORE;
   return explicit ? path.resolve(explicit) : GUARDIAN_PATH;
 }
 
@@ -54,13 +54,13 @@ export function dumpNotices(ctx) {
 
 export async function prefixText(ext, ctx) {
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("prefix", ctx);
+  await ext.commands.get("cache-stats").handler("prefix", ctx);
   return dumpNotices(ctx);
 }
 
 export async function statsText(ext, ctx) {
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   return dumpNotices(ctx);
 }
 

@@ -14,7 +14,7 @@ import {
 
 isolateCacheEnv();
 
-const { default: guardianFactory, cacheHitPct, aggregateHit, createInstanceState, resetRunState, readFooterCtx } = await import("../extensions/cache-stats.ts");
+const { default: guardianFactory, cacheHitPct, aggregateHit, createInstanceState, resetRunState, readFooterCtx, computeTurnTps, formatTps } = await import("../extensions/cache-stats.ts");
 const loaded = await loadSdk();
 const { ExtensionRunner, buildSystemPrompt, version: sdkVersion } = loaded;
 console.log(`SDK under test: ${sdkVersion} (${loaded.dist})`);
@@ -1607,7 +1607,340 @@ async function fresh(ctx = mockContext(), factory = guardianFactory, name = "gua
     });
     assert.match(footerComponent.render(200)[0], /▸ 200 t\/s/, "a new request re-records t0 and estimates again");
 
+    // Turn 4: streaming stamps (firstThinkingAt/firstTextAt/lastDeltaAt/doneAt) are also consumed once.
+    fakeNow = 12_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 12_000_200;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t" } });
+    fakeNow = 12_000_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 12_001_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "b" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 100, reasoning: 20 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 80 t\/s/, "streaming turn estimates from decode window");
+
+    // Turn 5: repeated turn_end with no new streaming stamps or request must render n/a.
+    fakeNow = 12_060_000;
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 100, reasoning: 20 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "consumed streaming stamps must not be reused on a repeated turn_end");
+
     ok("TPS t0 is consumed exactly once per turn; no stale-t0 re-consumption");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 1: TTFT prefill excluded, decode window starts at first non-empty text/toolcall delta (90 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-ttft-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 20_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    // Request starts at t=0, 6s TTFT prefill (empty delta at +5s ignored), 1s decode (t=+6s..+7s) for 90 tokens -> 90 t/s
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 20_005_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "" } });
+    fakeNow = 20_006_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "Hello" } });
+    fakeNow = 20_007_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: " world" } });
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "done" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 500, output: 90 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 90 t\/s/, "TTFT must be excluded so 90 tokens over 1s decode renders 90 t/s");
+
+    // toolcall_delta also starts the decode window when no text_delta precedes it
+    fakeNow = 20_010_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 20_013_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "toolcall_delta", delta: "{\"a\":" } });
+    fakeNow = 20_014_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "toolcall_delta", delta: "1}" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 500, output: 90 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 90 t\/s/, "toolcall_delta must be folded into text decode window (90 t/s)");
+
+    ok("TPS streaming: excludes TTFT prefill and measures from first text/toolcall delta (90 t/s)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 2: pure thinking stream without text_delta uses firstThinkingAt (80 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-thinking-only-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 30_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 30_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "step 1" } });
+    fakeNow = 30_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "step 2" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 100, output: 80, reasoning: 80 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 80 t\/s/, "pure thinking stream must measure output over [firstThinkingAt, end] (80 t/s)");
+    ok("TPS streaming: pure thinking stream uses firstThinkingAt (80 t/s)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 3: thinking + text splits reasoning (100 t/s) or falls back to full window when reasoning is 0 (75 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-split-reasoning-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 40_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    // 3a. canSplitReasoning=true: thinking [1s..2s] (50 reasoning tokens), text [2s..3s] (100 text tokens, total output 150) -> 100 t/s
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 40_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "think" } });
+    fakeNow = 40_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "answer" } });
+    fakeNow = 40_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: " done" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 100, output: 150, completion_tokens_details: { reasoning_tokens: 50 } } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 100 t\/s/, "canSplitReasoning=true must measure (output-reasoning) over [firstTextAt, end] (100 t/s)");
+
+    // 3b. Anthropic-like fallback (reasoning=0): same timestamps [1s..3s] (2s total), output=150, reasoning=0 -> 150 / 2s = 75 t/s
+    fakeNow = 41_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 41_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "think" } });
+    fakeNow = 41_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "answer" } });
+    fakeNow = 41_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: " done" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 100, output: 150 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 75 t\/s/, "missing reasoning tokens must fall back to full [firstThinkingAt, end] window (75 t/s)");
+
+    ok("TPS streaming: canSplitReasoning splits text window (100 t/s) and falls back when reasoning is 0 (75 t/s)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 4: message_end locks doneAt before tool execution so tool latency is excluded (100 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-tool-isolation-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 50_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 50_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "toolcall_delta", delta: "{\"cmd\":" } });
+    fakeNow = 50_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "toolcall_delta", delta: "\"run\"}" } });
+    // agent-loop emits message_end when stream finishes, BEFORE running tools (no message_update type=done)
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    fakeNow = 50_002_100;
+    await fire(ext, "tool_execution_start", ctx, {});
+    fakeNow = 50_011_000; // +9s slow tool execution
+    await fire(ext, "tool_execution_end", ctx, {});
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 100, output: 100 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 100 t\/s/, "tool execution latency after message_end must not dilute TPS (100 t/s)");
+    ok("TPS streaming: message_end locks doneAt before tool execution (100 t/s)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 5: four sanity guards return n/a on anomalous windows and retry clears partial stamps ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-guards-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 60_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+
+    // Guard 1: w < 100ms -> n/a
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 60_000_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 60_000_550; // w = 50ms < 100ms
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 50 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "w < 100ms must fail guard 1 and render n/a");
+
+    // Guard 2: n * 1000 > 10000 * w (> 10,000 t/s) -> n/a
+    fakeNow = 61_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 61_000_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 61_000_600; // w = 100ms
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 1500 } }, // 15,000 t/s
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "tps > 10000 t/s must fail guard 2 and render n/a");
+
+    // Guard 3: flow * 4 < w (active flow < 25% of decode window) -> n/a
+    fakeNow = 62_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 62_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 62_001_200; // lastDeltaAt -> flow = 200ms
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "b" } });
+    fakeNow = 62_002_000; // doneAt -> w = 1000ms, flow*4 = 800 < 1000
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 50 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "flow * 4 < w must fail guard 3 and render n/a");
+
+    // Guard 4: think > 0 && firstText > 0 && n * (firstText - ttft) > 20 * think * w -> n/a
+    fakeNow = 63_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 63_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t" } });
+    fakeNow = 63_002_000; // firstText - ttft = 1000ms, reasoning = 10 -> 10 t/s
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 63_002_100; // text window w = 100ms, n = 500 -> 5000 t/s (500 * 1000 > 20 * 10 * 100)
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "b" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 510, reasoning: 10 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "n * (firstText - ttft) > 20 * think * w must fail guard 4 and render n/a");
+
+    // Retry before_provider_request discards half-recorded thinking stamp from aborted attempt
+    fakeNow = 64_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 64_000_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "aborted" } });
+    fakeNow = 64_002_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} }); // retry clears streamFirstThinkingAt
+    fakeNow = 64_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "ok" } });
+    fakeNow = 64_004_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "!" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 80 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 80 t\/s/, "retry before_provider_request must clear stale partial streaming stamps (80 t/s)");
+
+    ok("TPS streaming: four sanity guards return n/a on anomalous windows and retry clears partial stamps");
   } finally {
     Date.now = realNow;
   }
@@ -1616,12 +1949,301 @@ async function fresh(ctx = mockContext(), factory = guardianFactory, name = "gua
 // ── Lifecycle: resetRunState/uninstallFooter clear TPS scratch fields ──
 {
   const state = createInstanceState(true);
+  assert.equal(state.streamFirstThinkingAt, null, "createInstanceState initializes streamFirstThinkingAt to null");
+  assert.equal(state.streamFirstTextAt, null, "createInstanceState initializes streamFirstTextAt to null");
+  assert.equal(state.streamLastDeltaAt, null, "createInstanceState initializes streamLastDeltaAt to null");
+  assert.equal(state.streamDoneAt, null, "createInstanceState initializes streamDoneAt to null");
   state.providerRequestStartedAt = 12345;
+  state.streamFirstThinkingAt = 12350;
+  state.streamFirstTextAt = 12360;
+  state.streamLastDeltaAt = 12370;
+  state.streamDoneAt = 12380;
   state.lastTurnTps = "45";
   resetRunState(state);
   assert.equal(state.providerRequestStartedAt, null, "resetRunState must clear providerRequestStartedAt");
+  assert.equal(state.streamFirstThinkingAt, null, "resetRunState must clear streamFirstThinkingAt");
+  assert.equal(state.streamFirstTextAt, null, "resetRunState must clear streamFirstTextAt");
+  assert.equal(state.streamLastDeltaAt, null, "resetRunState must clear streamLastDeltaAt");
+  assert.equal(state.streamDoneAt, null, "resetRunState must clear streamDoneAt");
   assert.equal(state.lastTurnTps, null, "resetRunState must clear lastTurnTps");
   ok("Lifecycle: resetRunState clears TPS scratch fields");
+}
+
+// ── TPS oracle audit (a): reasoning == output with text stream returns n/a (not full-window fallback) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-oracle-a" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 70_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 70_001_000; // firstAny = 1000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "think" } });
+    fakeNow = 70_002_000; // firstText = 2000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "text" } });
+    fakeNow = 70_003_000; // end = 3000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "!" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 100, reasoning: 100 } },
+    });
+    assert.equal(
+      computeTurnTps(
+        { firstThinkingAt: 1000, firstTextAt: 2000, lastDeltaAt: 3000, doneAt: 3000 },
+        { role: "assistant", usage: { output: 100, reasoning: 100 } },
+      ),
+      null,
+      "reasoning == output with text stream has n = 0 and must return null",
+    );
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "reasoning == output with text stream must render n/a (not 50 t/s)");
+    ok("TPS oracle (a): reasoning == output with text stream renders n/a");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS oracle audit (b): interleaved stream with text before thinking uses from=firstText, n=output-reasoning (75 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-oracle-b" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 71_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 71_002_000; // firstText = 2000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "hello" } });
+    fakeNow = 71_003_000; // firstThinking = 3000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "hmm" } });
+    fakeNow = 71_004_000; // end = 4000
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 200, reasoning: 50 } },
+    });
+    assert.equal(
+      computeTurnTps(
+        { firstTextAt: 2000, firstThinkingAt: 3000, lastDeltaAt: 3000, doneAt: 4000 },
+        { role: "assistant", usage: { output: 200, reasoning: 50 } },
+      ),
+      "75",
+      "interleaved text-before-thinking must measure n=150 over w=2000 -> 75 t/s",
+    );
+    assert.match(footerComponent.render(200)[0], /▸ 75 t\/s/, "interleaved text-before-thinking must render 75 t/s");
+
+    // Non-streaming fallback bit-for-bit check: message_end without streaming deltas must NOT set streamDoneAt
+    fakeNow = 72_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 72_001_000;
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    fakeNow = 72_002_000; // turn_end at +2000ms from requestStartedAt
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 90 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 45 t\/s/, "non-streaming fallback must ignore message_end and use turnEndedAt - requestStartedAt (45 t/s)");
+
+    ok("TPS oracle (b): interleaved text-before-thinking renders 75 t/s and non-streaming ignores message_end");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS oracle audit (c): pure thinking stream with reasoning > output returns n/a ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-oracle-c" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 73_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 73_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t1" } });
+    fakeNow = 73_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t2" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 50, reasoning: 80 } },
+    });
+    assert.equal(
+      computeTurnTps(
+        { firstThinkingAt: 2000, lastDeltaAt: 3000, doneAt: 3000 },
+        { role: "assistant", usage: { output: 50, reasoning: 80 } },
+      ),
+      null,
+      "pure thinking stream with reasoning > output is not visible and must return null",
+    );
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "pure thinking stream with reasoning > output must render n/a");
+    ok("TPS oracle (c): pure thinking stream with reasoning > output renders n/a");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS oracle audit (d): 20x guard uses (firstText - firstAny) rather than (firstText - firstThinking) + magpie decodeOf differential check ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-oracle-d" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 74_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    // First content is text (firstAny = firstText = 1000), thinking starts at 1500, stream ends at 1600:
+    // (firstText - firstAny) = 0 -> 20x guard lhs is 0 <= 20 * think * w -> passes (166.7 t/s)
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 74_001_000; // firstAny = firstText = 1000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 74_001_500; // firstThinking = 1500
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t" } });
+    fakeNow = 74_001_600; // end = 1600, w = 600ms, flow = 500ms (flow*4 = 2000 >= 600)
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 101, reasoning: 1 } },
+    });
+    assert.match(
+      footerComponent.render(200)[0],
+      /▸ 166\.7 t\/s/,
+      "when firstAny == firstText == 1000 and firstThinking == 1500, (firstText - firstAny) == 0 so 20x guard passes (166.7 t/s)",
+    );
+
+    // Reference implementation copied verbatim from magpie binary decodeOf (offset 28711427):
+    const reasoningOf = (r) => r.think ?? 0;
+    function decodeOfRef(r) {
+      const { ttft, firstReasoning, firstText, flow, ms } = r;
+      const think = reasoningOf(r), visible = think > 0 && !(firstText > 0) && firstReasoning >= ttft && flow > 0 && think <= r.out;
+      const n = think > 0 && !visible ? r.out - think : r.out,
+            from = visible ? firstReasoning : think > 0 ? firstText : ttft;
+      const w = ms - from;
+      if (!(n > 0 && ttft > 0 && from > 0 && w >= 100 && n * 1000 <= 10000 * w)) return null;
+      if (flow > 0 && flow * 4 < w) return null;
+      if (think > 0 && firstText > 0 && n * (firstText - ttft) > 20 * think * w) return null;
+      return formatTps(n, w);
+    }
+
+    const differentialSamples = [
+      // 1. magpie S1: thinking + text split -> 90.8
+      { name: "S1", firstThinkingAt: 6402, firstTextAt: 8240, lastDeltaAt: 18065, doneAt: 17575, out: 989, think: 141 },
+      // 2. magpie S2: thinking + text split -> 137.6
+      { name: "S2", firstThinkingAt: 5504, firstTextAt: 11989, lastDeltaAt: 12694, doneAt: 12694, out: 467, think: 370 },
+      // 3. magpie S3: text only, think=0 -> 71.3
+      { name: "S3", firstThinkingAt: null, firstTextAt: 6418, lastDeltaAt: 18118, doneAt: 18118, out: 834, think: 0 },
+      // 4. pure thinking visible (think <= out) -> 80
+      { name: "pure-thinking-visible", firstThinkingAt: 2000, firstTextAt: null, lastDeltaAt: 3000, doneAt: 3000, out: 80, think: 80 },
+      // 5. oracle a: reasoning == output with text stream -> null
+      { name: "oracle-a-equal-reasoning-out", firstThinkingAt: 1000, firstTextAt: 2000, lastDeltaAt: 3000, doneAt: 3000, out: 100, think: 100 },
+      // 6. oracle b: interleaved text before thinking -> 75
+      { name: "oracle-b-text-before-thinking", firstThinkingAt: 3000, firstTextAt: 2000, lastDeltaAt: 3000, doneAt: 4000, out: 200, think: 50 },
+      // 7. oracle c: pure thinking reasoning > output -> null
+      { name: "oracle-c-pure-thinking-exceeds-out", firstThinkingAt: 2000, firstTextAt: null, lastDeltaAt: 3000, doneAt: 3000, out: 50, think: 80 },
+      // 8. oracle d / 20x guard breach: n * (firstText - ttft) > 20 * think * w -> null
+      { name: "guard-20x-breach", firstThinkingAt: 1000, firstTextAt: 2000, lastDeltaAt: 2100, doneAt: 2100, out: 510, think: 10 },
+      // 9. oracle d / interleaved firstAny=firstText=1000, firstThinking=1500 -> 166.7
+      { name: "oracle-d-interleaved-denom", firstThinkingAt: 1500, firstTextAt: 1000, lastDeltaAt: 1500, doneAt: 1600, out: 101, think: 1 },
+    ];
+
+    for (const s of differentialSamples) {
+      const ttft = s.firstThinkingAt !== null && s.firstTextAt !== null
+        ? Math.min(s.firstThinkingAt, s.firstTextAt)
+        : (s.firstThinkingAt ?? s.firstTextAt ?? 0);
+      const ms = s.doneAt ?? s.lastDeltaAt;
+      const flow = (s.lastDeltaAt ?? ms) - ttft;
+      const expected = decodeOfRef({
+        ttft,
+        firstReasoning: s.firstThinkingAt ?? 0,
+        firstText: s.firstTextAt ?? 0,
+        flow,
+        ms,
+        out: s.out,
+        think: s.think,
+      });
+      const actual = computeTurnTps(
+        {
+          firstThinkingAt: s.firstThinkingAt,
+          firstTextAt: s.firstTextAt,
+          lastDeltaAt: s.lastDeltaAt,
+          doneAt: s.doneAt,
+        },
+        { role: "assistant", usage: { output: s.out, reasoning: s.think } },
+      );
+      assert.equal(actual, expected, `differential mismatch on ${s.name}: actual=${actual} vs decodeOf=${expected}`);
+    }
+
+    ok("TPS oracle (d): 20x guard uses (firstText - firstAny) and computeTurnTps matches magpie decodeOf across 9 samples");
+  } finally {
+    Date.now = realNow;
+  }
 }
 
 console.log(`All cache-stats regressions passed (${passed} cases, sdk=${sdkVersion})`);

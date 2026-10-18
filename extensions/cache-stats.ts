@@ -38,6 +38,7 @@ export type CacheUsage = {
   output?: number;
   cacheRead?: number;
   cacheWrite?: number;
+  reasoning?: number;
   totalTokens?: number;
   total?: number;
   prompt_tokens?: number;
@@ -47,6 +48,16 @@ export type CacheUsage = {
     cached_tokens?: number;
     [key: string]: any;
   };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
+    [key: string]: any;
+  };
+  output_tokens_details?: {
+    reasoning_tokens?: number;
+    [key: string]: any;
+  };
+  reasoning_tokens?: number;
+  reasoningTokens?: number;
   cached_tokens?: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
@@ -55,6 +66,11 @@ export type CacheUsage = {
   prompt_cache_miss_tokens?: number;
   [key: string]: any;
 };
+
+function clampNonNeg(v: any): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 
 /**
  * Normalize diverse provider usage payloads (Pi native, OpenAI prompt_tokens/completion_tokens/total_tokens,
@@ -65,11 +81,12 @@ export function normalizeUsage(u: any): {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  reasoning: number;
   totalTokens: number;
   total: number;
 } {
   if (!u || typeof u !== "object") {
-    return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, total: 0 };
+    return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 0, total: 0 };
   }
   const cacheRead = Number(
     u.cacheRead ??
@@ -104,6 +121,15 @@ export function normalizeUsage(u: any): {
     0
   ) || 0;
 
+  const reasoning = clampNonNeg(
+    u.reasoning ??
+    u.reasoning_tokens ??
+    u.reasoningTokens ??
+    u.completion_tokens_details?.reasoning_tokens ??
+    u.output_tokens_details?.reasoning_tokens ??
+    0
+  );
+
   const totalTokens = Number(
     u.totalTokens ??
     u.total_tokens ??
@@ -116,6 +142,7 @@ export function normalizeUsage(u: any): {
     output,
     cacheRead,
     cacheWrite,
+    reasoning,
     totalTokens,
     total: totalTokens,
   };
@@ -386,11 +413,15 @@ type InstanceState = {
     aggregate: number | null;
     latest: number | null;
   } | null;
-  // TPS estimation: t0 of the last provider request (Date.now()), and the
-  // formatted tokens/s of the last completed assistant turn (null -> footer n/a).
-  // t0 is consumed (set back to null) by the turn_end that estimates from it, so
-  // each turn's stamp is used exactly once; before_provider_request re-records it.
+  // TPS estimation: request start t0, streaming decode stamps, and the formatted
+  // tokens/s of the last completed assistant turn (null -> footer n/a).
+  // All timing stamps are consumed (cleared via clearTurnTiming) by turn_end or
+  // reset by the next before_provider_request so each turn's stamps are used once.
   providerRequestStartedAt: number | null;
+  streamFirstThinkingAt: number | null;
+  streamFirstTextAt: number | null;
+  streamLastDeltaAt: number | null;
+  streamDoneAt: number | null;
   lastTurnTps: string | null;
   footerInstalled: boolean;
   prefixDiagEnabled: boolean;
@@ -433,6 +464,10 @@ export function createInstanceState(prefixDiagEnabled: boolean): InstanceState {
     footerResetBaseline: null,
     footerHitCache: null,
     providerRequestStartedAt: null,
+    streamFirstThinkingAt: null,
+    streamFirstTextAt: null,
+    streamLastDeltaAt: null,
+    streamDoneAt: null,
     lastTurnTps: null,
     footerInstalled: false,
     prefixDiagEnabled,
@@ -445,6 +480,14 @@ export function createInstanceState(prefixDiagEnabled: boolean): InstanceState {
 function clearPrefixMemory(state: InstanceState): void {
   state.prefixByScope.clear();
   state.lastPrefixDiag = null;
+}
+
+export function clearTurnTiming(state: InstanceState): void {
+  state.providerRequestStartedAt = null;
+  state.streamFirstThinkingAt = null;
+  state.streamFirstTextAt = null;
+  state.streamLastDeltaAt = null;
+  state.streamDoneAt = null;
 }
 
 export function resetRunState(state: InstanceState): void {
@@ -464,9 +507,9 @@ export function resetRunState(state: InstanceState): void {
   state.footerResetEpoch += 1;
   state.footerResetBaseline = null;
   state.footerHitCache = null;
-  // Never carry a previous session's request timestamp or estimated speed across
+  // Never carry a previous session's timing stamps or estimated speed across
   // a reset / session_start; both must render n/a until this run produces a turn.
-  state.providerRequestStartedAt = null;
+  clearTurnTiming(state);
   state.lastTurnTps = null;
 }
 
@@ -667,12 +710,87 @@ function recordTurnUsage(state: InstanceState, rawMessage: any): void {
  * meaningful (missing/consumed t0, no assistant usage, output not a finite
  * positive number, elapsed <= 0). The caller renders null as n/a.
  */
-function computeTurnTps(t0: number | null, rawMessage: any): string | null {
+export type TurnTimingStamps = {
+  requestStartedAt?: number | null;
+  firstAnyAt?: number | null;
+  firstThinkingAt?: number | null;
+  firstTextAt?: number | null;
+  lastDeltaAt?: number | null;
+  doneAt?: number | null;
+  turnEndedAt?: number | null;
+};
+
+function toStamp(v: any): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+export function computeTurnTps(
+  timingOrT0: TurnTimingStamps | number | null,
+  rawMessage: any,
+): string | null {
   if (!rawMessage || typeof rawMessage !== "object") return null;
   if (rawMessage.role !== "assistant" || !rawMessage.usage) return null;
-  if (typeof t0 !== "number") return null;
-  const output = normalizeUsage(rawMessage.usage).output;
-  return formatTps(output, Date.now() - t0);
+  const norm = normalizeUsage(rawMessage.usage);
+  if (!Number.isFinite(norm.output) || norm.output <= 0) return null;
+
+  let requestStartedAt: number | null = null;
+  let explicitFirstAnyAt: number | null = null;
+  let firstThinkingAt: number | null = null;
+  let firstTextAt: number | null = null;
+  let lastDeltaAt: number | null = null;
+  let doneAt: number | null = null;
+  let turnEndedAt: number | null = null;
+
+  if (typeof timingOrT0 === "number") {
+    requestStartedAt = toStamp(timingOrT0);
+  } else if (timingOrT0 && typeof timingOrT0 === "object") {
+    requestStartedAt = toStamp(timingOrT0.requestStartedAt);
+    explicitFirstAnyAt = toStamp(timingOrT0.firstAnyAt);
+    firstThinkingAt = toStamp(timingOrT0.firstThinkingAt);
+    firstTextAt = toStamp(timingOrT0.firstTextAt);
+    lastDeltaAt = toStamp(timingOrT0.lastDeltaAt);
+    doneAt = toStamp(timingOrT0.doneAt);
+    turnEndedAt = toStamp(timingOrT0.turnEndedAt);
+  }
+
+  // Non-streaming fallback: no streaming delta stamps -> end-to-end [requestStartedAt, doneAt ?? turnEndedAt]
+  if (firstThinkingAt === null && firstTextAt === null && explicitFirstAnyAt === null) {
+    if (requestStartedAt === null) return null;
+    const end = doneAt ?? turnEndedAt ?? Date.now();
+    return formatTps(norm.output, end - requestStartedAt);
+  }
+
+  // Streaming decode window (aligned to magpie decodeOf):
+  const firstAnyAt =
+    explicitFirstAnyAt ??
+    (firstThinkingAt !== null && firstTextAt !== null
+      ? Math.min(firstThinkingAt, firstTextAt)
+      : (firstThinkingAt ?? firstTextAt));
+  if (firstAnyAt === null) return null;
+
+  const end = doneAt ?? lastDeltaAt ?? turnEndedAt ?? Date.now();
+  const flow = (lastDeltaAt ?? end) - firstAnyAt;
+  const think = norm.reasoning;
+  const out = norm.output;
+  const visible =
+    think > 0 &&
+    !(firstTextAt !== null && firstTextAt > 0) &&
+    firstThinkingAt !== null &&
+    firstThinkingAt >= firstAnyAt &&
+    flow > 0 &&
+    think <= out;
+  const n = think > 0 && !visible ? out - think : out;
+  const from = visible ? firstThinkingAt : think > 0 ? firstTextAt : firstAnyAt;
+  if (from === null) return null;
+
+  const w = end - from;
+  if (!(n > 0 && firstAnyAt > 0 && from > 0 && w >= 100 && n * 1000 <= 10000 * w)) return null;
+  if (flow > 0 && flow * 4 < w) return null;
+  if (think > 0 && firstTextAt !== null && firstTextAt > 0 && n * (firstTextAt - firstAnyAt) > 20 * think * w) {
+    return null;
+  }
+
+  return formatTps(n, w);
 }
 
 export function extractAndNormalizeUsage(
@@ -734,7 +852,7 @@ function uninstallFooter(state: InstanceState, ui: any): void {
   state.footerSources = null;
   state.footerContext = null;
   state.footerHitCache = null;
-  state.providerRequestStartedAt = null;
+  clearTurnTiming(state);
   state.lastTurnTps = null;
   state.footerInstalled = false;
 }
@@ -1676,10 +1794,10 @@ export default function (pi: ExtensionAPI) {
   // ── 2. before_provider_request: read-only prefix snapshot ──
   pi.on("before_provider_request", (event, ctx) => {
     if (!state.runtimeEnabled) return;
-    // TPS t0: mark the start of this provider request. Tool loops fire this hook
-    // once per request; the last one before turn_end wins, so the elapsed time
-    // matches the request whose assistant usage turn_end reports. turn_end
-    // consumes (clears) the stamp, so the next turn always re-records its own t0.
+    // TPS timing: clear any half-recorded streaming stamps from a failed/retried
+    // request, then mark the start of this provider request. Tool loops fire this
+    // hook once per request; the last one before turn_end wins.
+    clearTurnTiming(state);
     state.providerRequestStartedAt = Date.now();
     try {
       if (state.prefixDiagEnabled) observePrefixDiagnostics(state, event.payload, ctx);
@@ -1768,20 +1886,63 @@ export default function (pi: ExtensionAPI) {
     state.liveRun = emptyLiveRun();
   });
 
-  // ── 4b. live footer updates during long runs: turn_end & tool executions ──
+  // ── 4b. live footer updates during long runs: streaming stamps, turn_end & tool executions ──
+  pi.on("message_update", (event) => {
+    if (!state.runtimeEnabled) return;
+    const ame = (event as any)?.assistantMessageEvent;
+    if (!ame || typeof ame !== "object") return;
+    const t = ame.type;
+    if (typeof t !== "string") return;
+    const now = Date.now();
+    if (t === "thinking_delta") {
+      if (typeof ame.delta === "string" && ame.delta !== "") {
+        if (state.streamFirstThinkingAt === null) {
+          state.streamFirstThinkingAt = now;
+        }
+        state.streamLastDeltaAt = now;
+      }
+    } else if (t === "text_delta" || t === "toolcall_delta") {
+      if (typeof ame.delta === "string" && ame.delta !== "") {
+        if (state.streamFirstTextAt === null) {
+          state.streamFirstTextAt = now;
+        }
+        state.streamLastDeltaAt = now;
+      }
+    } else if (t === "done") {
+      state.streamDoneAt = now;
+    }
+  });
+
+  pi.on("message_end", (event) => {
+    if (!state.runtimeEnabled) return;
+    const msg = (event as any)?.message;
+    if (!msg || typeof msg !== "object" || msg.role !== "assistant") return;
+    if (
+      state.streamDoneAt === null &&
+      (state.streamFirstThinkingAt !== null || state.streamFirstTextAt !== null)
+    ) {
+      state.streamDoneAt = Date.now();
+    }
+  });
+
   pi.on("turn_end", (event, ctx) => {
     if (!state.runtimeEnabled) return;
     if (event.message) {
       recordTurnUsage(state, event.message);
     }
-    // TPS: take this turn's t0 and consume it exactly once — read it, drop it,
-    // then estimate. Without the drop, a second turn_end with no new
-    // before_provider_request in between would reuse the same t0, so elapsed
-    // would keep growing from that old stamp and t/s would collapse toward 0.
-    // The next turn's before_provider_request re-records a fresh t0.
-    const turnStartedAt = state.providerRequestStartedAt;
-    state.providerRequestStartedAt = null;
-    state.lastTurnTps = computeTurnTps(turnStartedAt, event.message);
+    // TPS: snapshot this turn's timing stamps and consume them exactly once via
+    // clearTurnTiming before estimating. A repeated turn_end with no new request
+    // or streaming delta in between sees all-null stamps and renders n/a.
+    const timing: TurnTimingStamps = {
+      requestStartedAt: state.providerRequestStartedAt,
+      firstThinkingAt: state.streamFirstThinkingAt,
+      firstTextAt: state.streamFirstTextAt,
+      lastDeltaAt: state.streamLastDeltaAt,
+      doneAt: state.streamDoneAt,
+      turnEndedAt: Date.now(),
+    };
+    clearTurnTiming(state);
+    state.lastTurnTps = computeTurnTps(timing, event.message);
     readFooterCtx(state, ctx);
     refreshFooter(state, false);
   });

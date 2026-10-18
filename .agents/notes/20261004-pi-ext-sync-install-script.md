@@ -38,19 +38,17 @@ supersedes: ""
 
 ## 遗留清单（本次范围外，需各自归属处置）
 
-1. **[本仓特有]** `.bak-*` 备份残留清理归属：`~/.pi/agent/extensions/` 下 `cache-guardian.ts.bak-2026*` 4 个、`no-tables.ts.bak-2026*` 2 个。该目录在 `/root/.pi/agent` 仓被 `.gitignore`、不属本仓库版本库，本仓库 CI 无权也无必要删除；按本次硬边界**不删**。归属：本机 pi 扩展目录管理者人工清理。
+> 注（2026-10-17）：条目 1（.bak 残留清理）、条目 3（无版本戳）经复核判定不做，已清理。
+
 2. 其它自研扩展的同类漂移（与 cache-guardian.ts 同目录共处）：
    - `codegraph-go.ts` 已在 `/root/workspace/codegraph-go` 处置（`integrations/pi/install.sh` + `deploy.sh` 调用），本次样板来源。
    - `ctxmode.ts` / `prism.ts` / `herdr-agent-state.ts` / `herdsman-pi.ts` / `auto-continue.ts` / `no-tables.ts` 仍为手工同步，归属各自源仓库，本仓库管不到。
-3. 扩展加载无版本戳（状态：跨仓未闭环，已收敛至单一权威源）：见 `/root/workspace/codegraph-go/.agents/notes/20261003-pi-ext-deploy-sync.md`「权威源声明」。
 
 ### 遗留清单补充（2026-10-04 修复轮登记；只登记、不实现）
 
-1. **[本仓特有]** 权限漂移漏检：幂等判据只看内容 md5，部署副本被改成非 644（极端如 000）时仍报 `unchanged`、不纠正权限，信号链断裂（审读实测过 md5 相同而 mode 分别为 600/644 的两文件）。
-2. **[本仓特有]** `install` / `dirname` 未做 `command -v` 预检（缺失时走 bash 原生报错，可见但格式不统一）。
+> 注（2026-10-17）：条目 1（权限漂移）、2（command -v 预检）、4（死代码核对）、5（快照免责）经复核判定不做，已清理。
+
 3. 给未来联邦中枢（`/root/workspace/pi-extensions`）的接口登记：本脚本输出为人类可读文本（`unchanged:` / `changed:`），退出码 0/1 不区分「本次同步了」与「本就无需同步」；且覆盖变量名是仓级的（本仓 `PI_EXT_DEST`、ctxmode 用 `PI_CTXMODE_EXT`），中枢级联须按仓适配。
-4. 双审第二轮观察——死代码核对：`integrations/pi/install.sh` 中 `[ -n "$DEST" ] || fail "destination is empty"` 在新的分支结构下已是死代码（`PI_EXT_DEST`、`HOME` 两个分支产出的 `DEST` 均非空），属防御性兜底、无害，保留；待后续统一接口时再议是否移除。
-5. 双审第二轮观察——快照免责：文中 md5 / 字节数均为 2026-10-04 时点快照（记录当时状态），不作契约；契约以脚本运行时输出为准。
 
 ## 修订记录（2026-10-04 修复轮：reviewer + oracle 双审 must-fix 闭环）
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# install.sh — 把仓库版 cache-guardian 扩展同步安装到 ~/.pi/agent/extensions/。
+# install.sh — 把仓库版 cache-stats 扩展同步安装到 ~/.pi/agent/extensions/。
 #
-# 背景：AGENTS.md「生效位置」与 README.md「Direct copy」此前只有手工 cp（旧副本
-# 先备份成 .bak-<时间戳> 再覆盖），没有任何机制保证同步被执行——部署目录里的
-# cache-guardian.ts.bak-2026* 就是这套手工流程的残留。本脚本把该步骤收成一个
-# 可单独执行验证的入口：
+# 背景：AGENTS.md「生效位置」与 README.md「Direct copy」早期只有手工 cp（旧副本
+# 先备份成 .bak-<时间戳> 再覆盖），没有任何机制保证同步被执行；更名 cache-stats
+# 前遗留的旧扩展与历史 .bak-* 残留若留在部署目录，还会被 Pi 扩展发现规则重复加载。
+# 本脚本把同步与旧版残留清理收成一个可单独执行验证的入口：
 #   integrations/pi/install.sh      # 或 pnpm sync
 #
 # DEST 语义定稿：目标是一个「文件路径」（~/.pi/agent/extensions/
-# cache-guardian.ts），不接受目录——指向已存在目录时显式失败，不静默补全
+# cache-stats.ts），不接受目录——指向已存在目录时显式失败，不静默补全
 # 文件名、不静默拷进目录。PI_EXT_DEST 可覆盖（验证/多机部署场景），且优先于
 # HOME：显式指定时不再校验 HOME（详见下方 PI_EXT_DEST 优先定稿）。
 #
@@ -27,7 +27,7 @@ fail() { echo "install.sh FAILED: $*" >&2; exit 1; }
 command -v md5sum >/dev/null 2>&1 || fail "md5sum not found in PATH (PATH=$PATH)"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SRC="$ROOT/extensions/cache-guardian.ts"
+SRC="$ROOT/extensions/cache-stats.ts"
 
 # PI_EXT_DEST 优先于 HOME：显式指定 PI_EXT_DEST 时直接采用、不再校验
 # HOME；仅在未指定时才回落到 HOME。否则「set PI_EXT_DEST explicitly」的
@@ -39,7 +39,7 @@ else
   # HOME 未导出时 set -u 只会抛一句晦涩的「未绑定的变量」；显式给出可操作提示。
   HOME_DIR="${HOME:-}"
   [ -n "$HOME_DIR" ] || fail "HOME is not set (or empty) — export HOME or set PI_EXT_DEST explicitly"
-  DEST="$HOME_DIR/.pi/agent/extensions/cache-guardian.ts"
+  DEST="$HOME_DIR/.pi/agent/extensions/cache-stats.ts"
 fi
 [ -n "$DEST" ] || fail "destination is empty"
 case "$DEST" in
@@ -84,5 +84,14 @@ else
   install -m 644 "$SRC" "$DEST"
   echo "changed: installed $DEST (md5 $SRC_MD5)"
 fi
+
+# 清理同目录下遗留的旧名扩展与历史手工备份（Pi 0.84.2 会把 .ts.bak-* 也当扩展加载）。
+DEST_DIR="$(dirname "$DEST")"
+for legacy in "$DEST_DIR/cache-guardian.ts" "$DEST_DIR"/cache-guardian.ts.bak-*; do
+  if [ "$legacy" != "$DEST" ] && { [ -f "$legacy" ] || [ -L "$legacy" ]; }; then
+    rm -- "$legacy"
+    echo "removed legacy: $legacy"
+  fi
+done
 
 echo "note: Pi 只在会话启动时加载扩展——需 /reload 或新会话才生效"

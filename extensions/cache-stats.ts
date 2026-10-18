@@ -1,28 +1,27 @@
 /**
- * cache-guardian — prompt-cache observation and conservative helpers for Pi Agent.
+ * cache-stats — prompt-cache observation and prefix diagnostics for Pi Agent.
  *
  * Default mode is safe observation: per-session stats, optional TUI footer, no
- * rewrite of system prompts or provider payloads. Optional lossless skill XML
- * compaction is explicit opt-in. There is no golden freeze, no bare-content
- * reorder, and no hidden mode that restores an earlier system prompt.
+ * rewrite of system prompts or provider payloads. There is no golden freeze, no
+ * bare-content reorder, and no hidden mode that restores an earlier system prompt.
  * Default-on prefix diagnostics compare system/developer/instructions/tools at
  * this extension's before_provider_request hook only. They are not a cache-hit
  * verdict, not a final HTTP body, and not a server token-prefix.
  *
- * Install: copy to ~/.pi/agent/extensions/cache-guardian.ts
+ * Install: copy to ~/.pi/agent/extensions/cache-stats.ts
  *
  * session_start (new / resume / fork / switch / reload) resets this instance's
  * current-run statistics. Historical session custom entries are not restored.
  */
 
-import type { ExtensionAPI, BuildSystemPromptOptions, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { isProxy } from "node:util/types";
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const LOG = "cache-guard";
-const PI_CACHE_GUARD_FOOTER_ENV = "PI_CACHE_GUARD_FOOTER";
-const PREFIX_DIAG_ENV = "PI_CACHE_GUARDIAN_PREFIX_DIAGNOSTICS";
+const LOG = "cache-stats";
+const PI_CACHE_STATS_FOOTER_ENV = "PI_CACHE_STATS_FOOTER";
+const PREFIX_DIAG_ENV = "PI_CACHE_STATS_PREFIX_DIAGNOSTICS";
 const TURN_REPORT_LIMIT = 50;
 const PREFIX_SCOPE_LIMIT = 8;
 const PREFIX_MAX_DEPTH = 8;
@@ -39,6 +38,7 @@ export type CacheUsage = {
   output?: number;
   cacheRead?: number;
   cacheWrite?: number;
+  reasoning?: number;
   totalTokens?: number;
   total?: number;
   prompt_tokens?: number;
@@ -48,6 +48,16 @@ export type CacheUsage = {
     cached_tokens?: number;
     [key: string]: any;
   };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
+    [key: string]: any;
+  };
+  output_tokens_details?: {
+    reasoning_tokens?: number;
+    [key: string]: any;
+  };
+  reasoning_tokens?: number;
+  reasoningTokens?: number;
   cached_tokens?: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
@@ -56,6 +66,11 @@ export type CacheUsage = {
   prompt_cache_miss_tokens?: number;
   [key: string]: any;
 };
+
+function clampNonNeg(v: any): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 
 /**
  * Normalize diverse provider usage payloads (Pi native, OpenAI prompt_tokens/completion_tokens/total_tokens,
@@ -66,11 +81,12 @@ export function normalizeUsage(u: any): {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  reasoning: number;
   totalTokens: number;
   total: number;
 } {
   if (!u || typeof u !== "object") {
-    return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, total: 0 };
+    return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 0, total: 0 };
   }
   const cacheRead = Number(
     u.cacheRead ??
@@ -105,6 +121,15 @@ export function normalizeUsage(u: any): {
     0
   ) || 0;
 
+  const reasoning = clampNonNeg(
+    u.reasoning ??
+    u.reasoning_tokens ??
+    u.reasoningTokens ??
+    u.completion_tokens_details?.reasoning_tokens ??
+    u.output_tokens_details?.reasoning_tokens ??
+    0
+  );
+
   const totalTokens = Number(
     u.totalTokens ??
     u.total_tokens ??
@@ -117,6 +142,7 @@ export function normalizeUsage(u: any): {
     output,
     cacheRead,
     cacheWrite,
+    reasoning,
     totalTokens,
     total: totalTokens,
   };
@@ -226,7 +252,7 @@ function scanLiveHitRates(entries: any[], start: number): LiveHitScan {
  *   itself to be computable (totalDenom > 0).
  * - toolResult / branch_summary / compaction usage counts towards aggregate only
  * - `resetBaseline` (number of entries at reset time) restricts the scan to entries
- *   appended after a /cache-guardian reset. If the entry list is now shorter than
+ *   appended after a /cache-stats reset. If the entry list is now shorter than
  *   the baseline (trimmed / replaced session), returns null/null (n/a) as a safe
  *   fallback instead of computing the wrong window.
  * - returns { aggregate: null, latest: null } when entries are empty, contain no usage,
@@ -372,7 +398,6 @@ type InstanceState = {
   liveRun: LiveRun;
   turnReports: TurnReport[];
   unknown400: Set<string>;
-  firstPromptChars: number | null;
   footerTui: { requestRender?: (force?: boolean) => void } | null;
   footerModelName: string;
   footerThinking: string | undefined;
@@ -388,11 +413,15 @@ type InstanceState = {
     aggregate: number | null;
     latest: number | null;
   } | null;
-  // TPS estimation: t0 of the last provider request (Date.now()), and the
-  // formatted tokens/s of the last completed assistant turn (null -> footer n/a).
-  // t0 is consumed (set back to null) by the turn_end that estimates from it, so
-  // each turn's stamp is used exactly once; before_provider_request re-records it.
+  // TPS estimation: request start t0, streaming decode stamps, and the formatted
+  // tokens/s of the last completed assistant turn (null -> footer n/a).
+  // All timing stamps are consumed (cleared via clearTurnTiming) by turn_end or
+  // reset by the next before_provider_request so each turn's stamps are used once.
   providerRequestStartedAt: number | null;
+  streamFirstThinkingAt: number | null;
+  streamFirstTextAt: number | null;
+  streamLastDeltaAt: number | null;
+  streamDoneAt: number | null;
   lastTurnTps: string | null;
   footerInstalled: boolean;
   prefixDiagEnabled: boolean;
@@ -426,7 +455,6 @@ export function createInstanceState(prefixDiagEnabled: boolean): InstanceState {
     liveRun: emptyLiveRun(),
     turnReports: [],
     unknown400: new Set<string>(),
-    firstPromptChars: null,
     footerTui: null,
     footerModelName: "",
     footerThinking: undefined,
@@ -436,6 +464,10 @@ export function createInstanceState(prefixDiagEnabled: boolean): InstanceState {
     footerResetBaseline: null,
     footerHitCache: null,
     providerRequestStartedAt: null,
+    streamFirstThinkingAt: null,
+    streamFirstTextAt: null,
+    streamLastDeltaAt: null,
+    streamDoneAt: null,
     lastTurnTps: null,
     footerInstalled: false,
     prefixDiagEnabled,
@@ -450,37 +482,40 @@ function clearPrefixMemory(state: InstanceState): void {
   state.lastPrefixDiag = null;
 }
 
+export function clearTurnTiming(state: InstanceState): void {
+  state.providerRequestStartedAt = null;
+  state.streamFirstThinkingAt = null;
+  state.streamFirstTextAt = null;
+  state.streamLastDeltaAt = null;
+  state.streamDoneAt = null;
+}
+
 export function resetRunState(state: InstanceState): void {
   state.snapshot = emptySnapshot();
   state.liveRun = emptyLiveRun();
   state.turnReports = [];
   state.unknown400.clear();
-  state.firstPromptChars = null;
   clearPrefixMemory(state);
   // Drop the captured ctx references (sessionManager / bound getContextUsage) so a
   // new session never keeps stale functions bound to a previous ctx. Re-capture
   // happens on the next readFooterCtx call (session_start / turn_end / tools /
   // model / thinking events). Invalidate footer live-hit cache and force a fresh
-  // baseline on the next /cache-guardian reset. session_start keeps baseline null
+  // baseline on the next /cache-stats reset. session_start keeps baseline null
   // so the footer keeps the all-session scope (full history) after resume/switch;
   // the /reset command sets the baseline to the current entry count right after.
   state.footerSources = null;
   state.footerResetEpoch += 1;
   state.footerResetBaseline = null;
   state.footerHitCache = null;
-  // Never carry a previous session's request timestamp or estimated speed across
+  // Never carry a previous session's timing stamps or estimated speed across
   // a reset / session_start; both must render n/a until this run produces a turn.
-  state.providerRequestStartedAt = null;
+  clearTurnTiming(state);
   state.lastTurnTps = null;
 }
 
 // ── Custom footer ────────────────────────────────────────────────────
 // Unified geometric icon set (user requirement: one symbol family, no emoji+mixin).
 const FOOTER_ICON = { sheep: "●", hit: "◆", hitLatest: "◇", context: "▲", tps: "▸", model: "■" };
-
-function estimateTokens(chars: number): number {
-  return Math.round(chars / 4);
-}
 
 function isEnabled(val: string | undefined): boolean {
   if (!val) return false;
@@ -490,24 +525,6 @@ function isEnabled(val: string | undefined): boolean {
 
 function modelKey(m: { provider?: string; id?: string } | undefined | null): string {
   return m ? `${m.provider}/${m.id}` : "unknown";
-}
-
-function escapeXml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function unescapeXml(s: string): string {
-  return s
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, "&");
 }
 
 // Pi's after_provider_response event exposes only status and headers; response bodies are unavailable.
@@ -693,12 +710,87 @@ function recordTurnUsage(state: InstanceState, rawMessage: any): void {
  * meaningful (missing/consumed t0, no assistant usage, output not a finite
  * positive number, elapsed <= 0). The caller renders null as n/a.
  */
-function computeTurnTps(t0: number | null, rawMessage: any): string | null {
+export type TurnTimingStamps = {
+  requestStartedAt?: number | null;
+  firstAnyAt?: number | null;
+  firstThinkingAt?: number | null;
+  firstTextAt?: number | null;
+  lastDeltaAt?: number | null;
+  doneAt?: number | null;
+  turnEndedAt?: number | null;
+};
+
+function toStamp(v: any): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+export function computeTurnTps(
+  timingOrT0: TurnTimingStamps | number | null,
+  rawMessage: any,
+): string | null {
   if (!rawMessage || typeof rawMessage !== "object") return null;
   if (rawMessage.role !== "assistant" || !rawMessage.usage) return null;
-  if (typeof t0 !== "number") return null;
-  const output = normalizeUsage(rawMessage.usage).output;
-  return formatTps(output, Date.now() - t0);
+  const norm = normalizeUsage(rawMessage.usage);
+  if (!Number.isFinite(norm.output) || norm.output <= 0) return null;
+
+  let requestStartedAt: number | null = null;
+  let explicitFirstAnyAt: number | null = null;
+  let firstThinkingAt: number | null = null;
+  let firstTextAt: number | null = null;
+  let lastDeltaAt: number | null = null;
+  let doneAt: number | null = null;
+  let turnEndedAt: number | null = null;
+
+  if (typeof timingOrT0 === "number") {
+    requestStartedAt = toStamp(timingOrT0);
+  } else if (timingOrT0 && typeof timingOrT0 === "object") {
+    requestStartedAt = toStamp(timingOrT0.requestStartedAt);
+    explicitFirstAnyAt = toStamp(timingOrT0.firstAnyAt);
+    firstThinkingAt = toStamp(timingOrT0.firstThinkingAt);
+    firstTextAt = toStamp(timingOrT0.firstTextAt);
+    lastDeltaAt = toStamp(timingOrT0.lastDeltaAt);
+    doneAt = toStamp(timingOrT0.doneAt);
+    turnEndedAt = toStamp(timingOrT0.turnEndedAt);
+  }
+
+  // Non-streaming fallback: no streaming delta stamps -> end-to-end [requestStartedAt, doneAt ?? turnEndedAt]
+  if (firstThinkingAt === null && firstTextAt === null && explicitFirstAnyAt === null) {
+    if (requestStartedAt === null) return null;
+    const end = doneAt ?? turnEndedAt ?? Date.now();
+    return formatTps(norm.output, end - requestStartedAt);
+  }
+
+  // Streaming decode window (aligned to magpie decodeOf):
+  const firstAnyAt =
+    explicitFirstAnyAt ??
+    (firstThinkingAt !== null && firstTextAt !== null
+      ? Math.min(firstThinkingAt, firstTextAt)
+      : (firstThinkingAt ?? firstTextAt));
+  if (firstAnyAt === null) return null;
+
+  const end = doneAt ?? lastDeltaAt ?? turnEndedAt ?? Date.now();
+  const flow = (lastDeltaAt ?? end) - firstAnyAt;
+  const think = norm.reasoning;
+  const out = norm.output;
+  const visible =
+    think > 0 &&
+    !(firstTextAt !== null && firstTextAt > 0) &&
+    firstThinkingAt !== null &&
+    firstThinkingAt >= firstAnyAt &&
+    flow > 0 &&
+    think <= out;
+  const n = think > 0 && !visible ? out - think : out;
+  const from = visible ? firstThinkingAt : think > 0 ? firstTextAt : firstAnyAt;
+  if (from === null) return null;
+
+  const w = end - from;
+  if (!(n > 0 && firstAnyAt > 0 && from > 0 && w >= 100 && n * 1000 <= 10000 * w)) return null;
+  if (flow > 0 && flow * 4 < w) return null;
+  if (think > 0 && firstTextAt !== null && firstTextAt > 0 && n * (firstTextAt - firstAnyAt) > 20 * think * w) {
+    return null;
+  }
+
+  return formatTps(n, w);
 }
 
 export function extractAndNormalizeUsage(
@@ -760,7 +852,7 @@ function uninstallFooter(state: InstanceState, ui: any): void {
   state.footerSources = null;
   state.footerContext = null;
   state.footerHitCache = null;
-  state.providerRequestStartedAt = null;
+  clearTurnTiming(state);
   state.lastTurnTps = null;
   state.footerInstalled = false;
 }
@@ -862,73 +954,6 @@ function installFooter(state: InstanceState, ui: any): void {
     };
   });
   state.footerInstalled = true;
-}
-
-// ── Optional lossless skill XML compact ──────────────────────────────────────
-const AVAILABLE_SKILLS_BLOCK = /<available_skills>[\s\S]*?<\/available_skills>/g;
-const VERBOSE_SKILL_ITEM =
-  /<skill>\s*<name>([\s\S]*?)<\/name>\s*<description>([\s\S]*?)<\/description>\s*<location>([\s\S]*?)<\/location>\s*<\/skill>/g;
-
-function skillKey(name: string, description: string, filePath: string): string {
-  return `${name}\n${description}\n${filePath}`;
-}
-
-/**
- * Replace a recognized Pi `<available_skills>` verbose listing with compact
- * attribute form. Keeps name, description, real filePath, and the surrounding
- * prologue (read vs bash guidance). Unknown, duplicate, already-compact, or
- * mismatched templates are passed through. Extra notes, comments, or unknown
- * nodes inside an otherwise-recognized block also pass the original prompt
- * through; only whitespace besides matched skill items may be rewritten.
- */
-function compactRecognizedSkills(prompt: string, opts: BuildSystemPromptOptions): string {
-  const skills = opts.skills;
-  if (!skills || skills.length === 0) return prompt;
-  const visible = skills.filter((s) => !s.disableModelInvocation);
-  if (visible.length === 0) return prompt;
-
-  const blocks = [...prompt.matchAll(AVAILABLE_SKILLS_BLOCK)];
-  if (blocks.length !== 1) return prompt;
-  const block = blocks[0][0];
-  if (/<skill\s/i.test(block)) return prompt;
-
-  const items = [...block.matchAll(VERBOSE_SKILL_ITEM)].map((m) => ({
-    name: unescapeXml(m[1].trim()),
-    description: unescapeXml(m[2].trim()),
-    filePath: unescapeXml(m[3].trim()),
-  }));
-  if (items.length === 0 || items.length !== visible.length) return prompt;
-
-  const visibleKeys = visible.map((s) => skillKey(s.name, s.description, s.filePath));
-  if (new Set(visibleKeys).size !== visible.length) return prompt;
-  const visibleSet = new Set(visibleKeys);
-  const itemKeys = items.map((s) => skillKey(s.name, s.description, s.filePath));
-  if (new Set(itemKeys).size !== items.length) return prompt;
-  for (const k of itemKeys) {
-    if (!visibleSet.has(k)) return prompt;
-  }
-
-  const openTag = "<available_skills>";
-  const closeTag = "</available_skills>";
-  if (!block.startsWith(openTag) || !block.endsWith(closeTag)) return prompt;
-  const inner = block.slice(openTag.length, block.length - closeTag.length);
-  const leftover = inner.replace(new RegExp(VERBOSE_SKILL_ITEM.source, "g"), "");
-  if (/\S/.test(leftover)) return prompt;
-
-  const compactInner = items
-    .map((s) => `  <skill name="${escapeXml(s.name)}" description="${escapeXml(s.description)}" location="${escapeXml(s.filePath)}"/>`)
-    .join("\n");
-  const compactBlock = `<available_skills>\n${compactInner}\n</available_skills>`;
-  return prompt.slice(0, blocks[0].index) + compactBlock + prompt.slice((blocks[0].index ?? 0) + block.length);
-}
-
-function maybeRewritePrompt(
-  original: string,
-  opts: BuildSystemPromptOptions,
-  skillCompact: boolean,
-): string {
-  if (!skillCompact) return original;
-  return compactRecognizedSkills(original, opts);
 }
 
 // ── Read-only prefix-change diagnostics (hook snapshot only) ─────────────────
@@ -1762,47 +1787,17 @@ export default function (pi: ExtensionAPI) {
   const rawPrefixDiag = process.env[PREFIX_DIAG_ENV];
   const prefixDiagEnabled = rawPrefixDiag === undefined || isEnabled(rawPrefixDiag);
   const state = createInstanceState(prefixDiagEnabled);
-  const verbose = isEnabled(process.env.PI_CACHE_GUARD_VERBOSE);
-  const guardEnabled = isEnabled(process.env.PI_CACHE_GUARD);
-  const guardThreshold = (() => {
-    const r = process.env.PI_CACHE_GUARD_THRESHOLD;
-    const n = Number(r);
-    return Number.isFinite(n) && n > 0 ? n : 90;
-  })();
-  const stripRetention = isEnabled(process.env.PI_CACHE_GUARD_STRIP_RETENTION);
-  const skillCompact = isEnabled(process.env.PI_CACHE_GUARD_SKILL_COMPACT);
-  const rawFooter = process.env[PI_CACHE_GUARD_FOOTER_ENV];
+  const verbose = isEnabled(process.env.PI_CACHE_STATS_VERBOSE);
+  const rawFooter = process.env[PI_CACHE_STATS_FOOTER_ENV];
   const footerOn = rawFooter === undefined || isEnabled(rawFooter);
 
-  // Deprecated PI_CACHE_GUARD_NO_PROMPT_REWRITE / NO_SKILL_COMPRESSION /
-  // PI_CACHE_NO_OPENAI_CACHE_KEY / PI_CACHE_OPENAI_CACHE_KEY are ignored and
-  // never restore freeze, lossy compression, key injection, or env mutation.
-
-  // ── 1. before_agent_start: default pass-through; optional lossless skill compact ──
-  pi.on("before_agent_start", async (event, _ctx) => {
-    if (!state.runtimeEnabled) return;
-    if (state.firstPromptChars === null) {
-      state.firstPromptChars = event.systemPrompt.length;
-      if (verbose) {
-        console.error(
-          `[${LOG}] First-turn prompt observed: ${state.firstPromptChars} chars (~${estimateTokens(state.firstPromptChars)} est. tokens, not exact)`,
-        );
-      }
-    }
-    const next = maybeRewritePrompt(event.systemPrompt, event.systemPromptOptions, skillCompact);
-    if (next !== event.systemPrompt) {
-      return { systemPrompt: next };
-    }
-    return;
-  });
-
-  // ── 2. before_provider_request: read-only prefix snapshot; optional strip of legacy retention ──
+  // ── 2. before_provider_request: read-only prefix snapshot ──
   pi.on("before_provider_request", (event, ctx) => {
     if (!state.runtimeEnabled) return;
-    // TPS t0: mark the start of this provider request. Tool loops fire this hook
-    // once per request; the last one before turn_end wins, so the elapsed time
-    // matches the request whose assistant usage turn_end reports. turn_end
-    // consumes (clears) the stamp, so the next turn always re-records its own t0.
+    // TPS timing: clear any half-recorded streaming stamps from a failed/retried
+    // request, then mark the start of this provider request. Tool loops fire this
+    // hook once per request; the last one before turn_end wins.
+    clearTurnTiming(state);
     state.providerRequestStartedAt = Date.now();
     try {
       if (state.prefixDiagEnabled) observePrefixDiagnostics(state, event.payload, ctx);
@@ -1819,11 +1814,6 @@ export default function (pi: ExtensionAPI) {
         },
         extras: null,
       };
-    }
-    const payload = event.payload as Record<string, unknown> | undefined;
-    if (!payload || typeof payload !== "object") return;
-    if (stripRetention && typeof payload.prompt_cache_retention === "string") {
-      delete payload.prompt_cache_retention;
     }
   });
 
@@ -1868,8 +1858,8 @@ export default function (pi: ExtensionAPI) {
       cr = fallback.cacheRead;
       cw = fallback.cacheWrite;
       denom = cacheHitDenom({ input: inp, cacheRead: cr, cacheWrite: cw });
-      // Fallback accumulates to snapshot so current-run aggregate and
-      // session_shutdown guard can read this turn's data.
+      // Fallback accumulates to snapshot so current-run aggregate
+      // can read this turn's data.
       state.snapshot.totalInput += inp;
       state.snapshot.totalOutput += outp;
       state.snapshot.totalCacheWrite += cw;
@@ -1887,7 +1877,7 @@ export default function (pi: ExtensionAPI) {
       // ExtensionContext only exposes a read-only SessionManager, but at runtime
       // the handler receives the full SessionManager, which does provide
       // appendCustomEntry(). Cast to the full type to call it.
-      (ctx.sessionManager as SessionManager).appendCustomEntry("cache-guard-turn", {
+      (ctx.sessionManager as SessionManager).appendCustomEntry("cache-stats-turn", {
         turn: state.snapshot.turns, input: inp, cacheRead: cr, cacheWrite: cw, denom, hitPct,
       });
     }
@@ -1896,20 +1886,63 @@ export default function (pi: ExtensionAPI) {
     state.liveRun = emptyLiveRun();
   });
 
-  // ── 4b. live footer updates during long runs: turn_end & tool executions ──
+  // ── 4b. live footer updates during long runs: streaming stamps, turn_end & tool executions ──
+  pi.on("message_update", (event) => {
+    if (!state.runtimeEnabled) return;
+    const ame = (event as any)?.assistantMessageEvent;
+    if (!ame || typeof ame !== "object") return;
+    const t = ame.type;
+    if (typeof t !== "string") return;
+    const now = Date.now();
+    if (t === "thinking_delta") {
+      if (typeof ame.delta === "string" && ame.delta !== "") {
+        if (state.streamFirstThinkingAt === null) {
+          state.streamFirstThinkingAt = now;
+        }
+        state.streamLastDeltaAt = now;
+      }
+    } else if (t === "text_delta" || t === "toolcall_delta") {
+      if (typeof ame.delta === "string" && ame.delta !== "") {
+        if (state.streamFirstTextAt === null) {
+          state.streamFirstTextAt = now;
+        }
+        state.streamLastDeltaAt = now;
+      }
+    } else if (t === "done") {
+      state.streamDoneAt = now;
+    }
+  });
+
+  pi.on("message_end", (event) => {
+    if (!state.runtimeEnabled) return;
+    const msg = (event as any)?.message;
+    if (!msg || typeof msg !== "object" || msg.role !== "assistant") return;
+    if (
+      state.streamDoneAt === null &&
+      (state.streamFirstThinkingAt !== null || state.streamFirstTextAt !== null)
+    ) {
+      state.streamDoneAt = Date.now();
+    }
+  });
+
   pi.on("turn_end", (event, ctx) => {
     if (!state.runtimeEnabled) return;
     if (event.message) {
       recordTurnUsage(state, event.message);
     }
-    // TPS: take this turn's t0 and consume it exactly once — read it, drop it,
-    // then estimate. Without the drop, a second turn_end with no new
-    // before_provider_request in between would reuse the same t0, so elapsed
-    // would keep growing from that old stamp and t/s would collapse toward 0.
-    // The next turn's before_provider_request re-records a fresh t0.
-    const turnStartedAt = state.providerRequestStartedAt;
-    state.providerRequestStartedAt = null;
-    state.lastTurnTps = computeTurnTps(turnStartedAt, event.message);
+    // TPS: snapshot this turn's timing stamps and consume them exactly once via
+    // clearTurnTiming before estimating. A repeated turn_end with no new request
+    // or streaming delta in between sees all-null stamps and renders n/a.
+    const timing: TurnTimingStamps = {
+      requestStartedAt: state.providerRequestStartedAt,
+      firstThinkingAt: state.streamFirstThinkingAt,
+      firstTextAt: state.streamFirstTextAt,
+      lastDeltaAt: state.streamLastDeltaAt,
+      doneAt: state.streamDoneAt,
+      turnEndedAt: Date.now(),
+    };
+    clearTurnTiming(state);
+    state.lastTurnTps = computeTurnTps(timing, event.message);
     readFooterCtx(state, ctx);
     refreshFooter(state, false);
   });
@@ -1924,24 +1957,6 @@ export default function (pi: ExtensionAPI) {
     if (!state.runtimeEnabled) return;
     readFooterCtx(state, ctx);
     refreshFooter(state, false);
-  });
-
-  // ── 5. session_shutdown: cache guard (any-breach: current run first, then all-session) ──
-  // The current run (since this process's session_start) is the scope the guard is
-  // meant to catch, so a low current run warns even if a resumed long session's
-  // historical highs keep the all-session aggregate above threshold. When the
-  // current run has no data, fall back to the all-session aggregate (footer scope).
-  pi.on("session_shutdown", (_event, ctx) => {
-    if (!state.runtimeEnabled || !guardEnabled || state.snapshot.turns === 0) return;
-    const session = readSessionAggregate(ctx);
-    const currentAgg = (state.snapshot.totalCacheRead === 0 && state.snapshot.totalCacheWrite === 0)
-      ? null
-      : aggregateHit(state.snapshot.totalCacheRead, state.snapshot.totalHitDenom);
-    if (currentAgg !== null && currentAgg < guardThreshold) {
-      ctx.ui.notify(`[${LOG}] Cache guard: current run hit=${currentAgg}% < threshold=${guardThreshold}% (session aggregate=${session.aggregate ?? "n/a"}%). Check /cache-guardian stats.`, "warning");
-    } else if (session.available && session.aggregate !== null && session.aggregate < guardThreshold) {
-      ctx.ui.notify(`[${LOG}] Cache guard: session aggregate=${session.aggregate}% < threshold=${guardThreshold}%. Check /cache-guardian stats.`, "warning");
-    }
   });
 
   // ── 6. session_start: reset this instance; install footer only when enabled + TUI + FOOTER ──
@@ -1966,8 +1981,8 @@ export default function (pi: ExtensionAPI) {
     refreshFooter(state, true);
   });
 
-  // ── 7. /cache-guardian command ──
-  pi.registerCommand("cache-guardian", {
+  // ── 7. /cache-stats command ──
+  pi.registerCommand("cache-stats", {
     description: "Cache observer: enable/disable/stats/reset/prefix",
     handler: async (args, ctx) => handleCommand(args, ctx),
   });
@@ -1981,7 +1996,7 @@ export default function (pi: ExtensionAPI) {
       state.runtimeEnabled = false;
       clearPrefixMemory(state);
       uninstallFooter(state, ctx.ui);
-      ctx.ui.notify(`[${LOG}] Disabled for this instance. Run /cache-guardian enable to re-enable.`, "info");
+      ctx.ui.notify(`[${LOG}] Disabled for this instance. Run /cache-stats enable to re-enable.`, "info");
       return;
     }
     if (cmd === "enable") {
@@ -2011,7 +2026,7 @@ export default function (pi: ExtensionAPI) {
       showPrefix(ctx, state);
       return;
     }
-    showStats(ctx, state, guardEnabled, guardThreshold, skillCompact, stripRetention);
+    showStats(ctx, state);
   }
 }
 
@@ -2049,10 +2064,6 @@ function readSessionAggregate(ctx: any): {
 function showStats(
   ctx: any,
   state: InstanceState,
-  guardEnabled: boolean,
-  guardThreshold: number,
-  skillCompact: boolean,
-  stripRetention: boolean,
 ) {
   const snap = state.snapshot;
   const reports = state.turnReports;
@@ -2070,9 +2081,6 @@ function showStats(
         return aggregateHit(tailRead, tailDenom);
       })()
     : null;
-  const firstInfo = state.firstPromptChars !== null
-    ? `${state.firstPromptChars} chars (~${estimateTokens(state.firstPromptChars)} est. tokens, not exact; diagnostic only, not restored)`
-    : "not yet observed";
 
   const lines = [
     `State: ${state.runtimeEnabled ? "enabled" : "disabled"}`,
@@ -2080,13 +2088,9 @@ function showStats(
     `Aggregate hit: ${agg !== null ? agg + "%" : "n/a"}  (current run; read=${snap.totalCacheRead} / denom=${snap.totalHitDenom})`,
     `Session aggregate: ${session.aggregate !== null ? session.aggregate + "%" : "n/a"}  (${state.footerResetBaseline !== null ? "all session, footer currently post-reset window; " : "all session, footer scope; "}read=${session.read} / denom=${session.denom})`,
     `Cumulative: input=${snap.totalInput}  output=${snap.totalOutput}  cacheRead=${snap.totalCacheRead}  cacheWrite=${snap.totalCacheWrite}`,
-    `First-turn prompt: ${firstInfo}`,
-    `Skill compact: ${skillCompact ? "on (lossless, recognized templates)" : "off"}`,
-    `Strip prompt_cache_retention: ${stripRetention ? "on (legacy field only)" : "off"}`,
     `${prefixStatsLine(state)} (hook snapshot; chars ≠ tokens; not a cache verdict)`,
   ];
   if (tail !== null) lines.push(`Tail (last 3) hit: ${tail}%`);
-  if (guardEnabled) lines.push(`Cache guard: ${agg !== null ? agg + "%" : "n/a"} vs threshold=${guardThreshold}%${agg !== null && agg < guardThreshold ? " [BELOW]" : ""}`);
   if (state.unknown400.size > 0) {
     lines.push(`Unclassified 400 models (strategy unchanged): ${[...state.unknown400].join(", ")}`);
   }

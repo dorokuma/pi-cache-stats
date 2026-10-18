@@ -4,7 +4,6 @@ import {
   GUARDIAN_PATH,
   fire,
   loadSdk,
-  makeSkill,
   mockContext,
   promptThrough,
   registerFactory,
@@ -20,7 +19,7 @@ console.log(`guardian path: ${GUARDIAN_PATH}`);
 
 const { default: guardianFactory } = await import(guardianHref);
 const loaded = await loadSdk();
-const { ExtensionRunner, buildSystemPrompt, version: sdkVersion } = loaded;
+const { ExtensionRunner, version: sdkVersion } = loaded;
 console.log(`SDK under test: ${sdkVersion} (${loaded.dist})`);
 
 const SENTINEL = {
@@ -61,13 +60,13 @@ function dumpAll(ctx) {
 
 async function prefixText(ext, ctx) {
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("prefix", ctx);
+  await ext.commands.get("cache-stats").handler("prefix", ctx);
   return dumpNotices(ctx);
 }
 
 async function statsText(ext, ctx) {
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   return dumpNotices(ctx);
 }
 
@@ -125,26 +124,6 @@ const TOOL_B = {
   type: "function",
   function: { name: "bash", description: "run shell", parameters: { type: "object", properties: { command: { type: "string" } } } },
 };
-
-function injectAvailableSkillsInner(prompt, transformInner) {
-  const re = /<available_skills>([\s\S]*?)<\/available_skills>/;
-  const m = prompt.match(re);
-  assert.ok(m, "expected available_skills block");
-  const next = `<available_skills>${transformInner(m[1])}</available_skills>`;
-  return prompt.slice(0, m.index) + next + prompt.slice(m.index + m[0].length);
-}
-
-function compactableSkillSet() {
-  return Array.from({ length: 4 }, (_, i) => makeSkill({
-    name: i === 3 ? "deploy-alias" : `skill-${i}`,
-    description: "Invoke when the user asks for safe deployment and preserve important safety prerequisites.",
-    filePath: i === 0
-      ? "/audit/skills/flat-file.md"
-      : i === 3
-        ? "/audit/skills/folder-other/SKILL.md"
-        : `/audit/skills/folder-${i}/SKILL.md`,
-  }));
-}
 
 // ── default read-only: identity / fields / env unchanged ──
 {
@@ -369,7 +348,7 @@ function compactableSkillSet() {
 {
   const { ext, ctx, runner } = await fresh();
   await runner.emitBeforeProviderRequest(chatPayload({ system: "S", tools: [TOOL_A] }));
-  await ext.commands.get("cache-guardian").handler("disable", ctx);
+  await ext.commands.get("cache-stats").handler("disable", ctx);
   const disabled = await prefixText(ext, ctx);
   assert.match(disabled, /Status: disabled/);
   const payload = chatPayload({ system: "S2", tools: [TOOL_B] });
@@ -377,7 +356,7 @@ function compactableSkillSet() {
   await runner.emitBeforeProviderRequest(payload);
   assert.deepEqual(payload, clone);
   assert.match(await prefixText(ext, ctx), /Status: disabled/);
-  await ext.commands.get("cache-guardian").handler("enable", ctx);
+  await ext.commands.get("cache-stats").handler("enable", ctx);
   await runner.emitBeforeProviderRequest(chatPayload({ system: "S", tools: [TOOL_A] }));
   assert.match(await prefixText(ext, ctx), /Status: baseline/);
   ok("disable stops updates and clears comparison; enable starts fresh");
@@ -386,7 +365,7 @@ function compactableSkillSet() {
 {
   const { ext, ctx, runner } = await fresh();
   await runner.emitBeforeProviderRequest(chatPayload({ system: "S", tools: [TOOL_A] }));
-  await ext.commands.get("cache-guardian").handler("reset", ctx);
+  await ext.commands.get("cache-stats").handler("reset", ctx);
   assert.match(await prefixText(ext, ctx), /no request observed|Status: n\/a/);
   await runner.emitBeforeProviderRequest(chatPayload({ system: "S", tools: [TOOL_A] }));
   assert.match(await prefixText(ext, ctx), /Status: baseline/);
@@ -394,7 +373,7 @@ function compactableSkillSet() {
 }
 
 {
-  process.env.PI_CACHE_GUARDIAN_PREFIX_DIAGNOSTICS = "0";
+  process.env.PI_CACHE_STATS_PREFIX_DIAGNOSTICS = "0";
   const { ext, ctx, runner } = await fresh(mockContext(), guardianFactory, "diag-off");
   const payload = chatPayload({ system: "S", tools: [TOOL_A] });
   const clone = structuredClone(payload);
@@ -403,8 +382,8 @@ function compactableSkillSet() {
   assert.match(await prefixText(ext, ctx), /Status: disabled/);
   const stats = await statsText(ext, ctx);
   assert.match(stats, /Prefix: disabled/);
-  delete process.env.PI_CACHE_GUARDIAN_PREFIX_DIAGNOSTICS;
-  ok("PI_CACHE_GUARDIAN_PREFIX_DIAGNOSTICS=0 disables diagnostics");
+  delete process.env.PI_CACHE_STATS_PREFIX_DIAGNOSTICS;
+  ok("PI_CACHE_STATS_PREFIX_DIAGNOSTICS=0 disables diagnostics");
 }
 
 {
@@ -544,44 +523,6 @@ function compactableSkillSet() {
   ok("unrecognized system text does not guess injection source");
 }
 
-// ── compact still keeps extra notes while prefix diagnostics are on ──
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner, ext, ctx } = await fresh(mockContext(), guardianFactory, "skill-extra-with-prefix");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const incoming = injectAvailableSkillsInner(base, (inner) => `\n  EXTRA_NOTE_BEFORE: keep this policy text.\n${inner}`);
-  const out = await promptThrough(runner, incoming, opts);
-  assert.equal(out, incoming);
-  const payload = chatPayload({ system: incoming, tools: [TOOL_A] });
-  const clone = structuredClone(payload);
-  await runner.emitBeforeProviderRequest(payload);
-  assert.deepEqual(payload, clone);
-  const text = await prefixText(ext, ctx);
-  assert.match(text, /Status: baseline/);
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact still passes extra notes through with prefix diagnostics on");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-recognized-with-prefix");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const incoming = buildSystemPrompt(opts);
-  const out = await promptThrough(runner, incoming, opts);
-  assert.notEqual(out, incoming);
-  assert.match(out, /<skill name="skill-0"/);
-  assert.ok(out.includes('description="Invoke when the user asks for safe deployment and preserve important safety prerequisites."'));
-  assert.ok(out.includes('location="/audit/skills/flat-file.md"'));
-  assert.ok(out.includes("deploy-alias"));
-  const names = [...out.matchAll(/<skill name="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(names, ["skill-0", "skill-1", "skill-2", "deploy-alias"]);
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact still keeps name/description/path/order with prefix diagnostics on");
-}
-
 {
   const stats = await (async () => {
     const { ext, ctx, runner } = await fresh();
@@ -590,7 +531,6 @@ function compactableSkillSet() {
   })();
   assert.match(stats, /Prefix: baseline shape=openai-chat/);
   assert.match(stats, /State: enabled/);
-  assert.match(stats, /Skill compact: off/);
   ok("default stats include a short prefix summary without breaking existing fields");
 }
 

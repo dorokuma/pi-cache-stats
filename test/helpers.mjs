@@ -3,27 +3,27 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const GUARDIAN_PATH = path.join(REPO_ROOT, "extensions", "cache-guardian.ts");
+export const GUARDIAN_PATH = path.join(REPO_ROOT, "extensions", "cache-stats.ts");
 
 /** Drop inherited PI_CACHE_* flags without losing the explicit SDK adapter. */
 export function isolateCacheEnv() {
-  const testSdk = process.env.PI_CACHE_GUARD_TEST_SDK;
+  const testSdk = process.env.PI_CACHE_STATS_TEST_SDK;
   const bench = {};
   for (const k of Object.keys(process.env)) {
-    if (k.startsWith("PI_CACHE_GUARD_BENCH")) bench[k] = process.env[k];
+    if (k.startsWith("PI_CACHE_STATS_BENCH")) bench[k] = process.env[k];
     if (k.startsWith("PI_CACHE")) delete process.env[k];
   }
-  if (testSdk) process.env.PI_CACHE_GUARD_TEST_SDK = testSdk;
+  if (testSdk) process.env.PI_CACHE_STATS_TEST_SDK = testSdk;
   Object.assign(process.env, bench);
 }
 
 /**
  * Resolve a Pi coding-agent SDK root.
- * PI_CACHE_GUARD_TEST_SDK may be the package directory or its dist/ directory.
+ * PI_CACHE_STATS_TEST_SDK may be the package directory or its dist/ directory.
  * Default: the project's @earendil-works/pi-coding-agent dependency.
  */
 export function resolveSdkDist() {
-  const explicit = process.env.PI_CACHE_GUARD_TEST_SDK;
+  const explicit = process.env.PI_CACHE_STATS_TEST_SDK;
   if (explicit) {
     const abs = path.resolve(explicit);
     if (fs.existsSync(path.join(abs, "index.js")) && fs.existsSync(path.join(abs, "core"))) {
@@ -31,7 +31,7 @@ export function resolveSdkDist() {
     }
     const dist = path.join(abs, "dist");
     if (fs.existsSync(path.join(dist, "index.js"))) return dist;
-    throw new Error(`PI_CACHE_GUARD_TEST_SDK does not look like a pi-coding-agent package or dist: ${abs}`);
+    throw new Error(`PI_CACHE_STATS_TEST_SDK does not look like a pi-coding-agent package or dist: ${abs}`);
   }
   const resolved = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
   return path.dirname(resolved);
@@ -120,19 +120,4 @@ export async function fire(ext, event, ctx, data = {}) {
 export async function promptThrough(runner, base, options = {}) {
   const r = await runner.emitBeforeAgentStart("offline-test", undefined, base, { cwd: "/tmp/guardian-fix-cwd", ...options });
   return r?.systemPrompt ?? base;
-}
-
-export function sourceInfo(filePath) {
-  return { path: filePath, source: "test" };
-}
-
-export function makeSkill(partial) {
-  return {
-    name: partial.name,
-    description: partial.description,
-    filePath: partial.filePath,
-    baseDir: partial.baseDir ?? path.dirname(partial.filePath),
-    sourceInfo: partial.sourceInfo ?? sourceInfo(partial.filePath),
-    disableModelInvocation: partial.disableModelInvocation ?? false,
-  };
 }

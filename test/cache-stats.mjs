@@ -1,15 +1,10 @@
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   GUARDIAN_PATH,
-  REPO_ROOT,
   fire,
   loadSdk,
-  makeSkill,
   mockContext,
   promptThrough,
   registerFactory,
@@ -19,7 +14,7 @@ import {
 
 isolateCacheEnv();
 
-const { default: guardianFactory, cacheHitPct, aggregateHit, createInstanceState, resetRunState, readFooterCtx } = await import("../extensions/cache-guardian.ts");
+const { default: guardianFactory, cacheHitPct, aggregateHit, createInstanceState, resetRunState, readFooterCtx, computeTurnTps, formatTps } = await import("../extensions/cache-stats.ts");
 const loaded = await loadSdk();
 const { ExtensionRunner, buildSystemPrompt, version: sdkVersion } = loaded;
 console.log(`SDK under test: ${sdkVersion} (${loaded.dist})`);
@@ -35,40 +30,6 @@ async function fresh(ctx = mockContext(), factory = guardianFactory, name = "gua
   const runner = runnerFor(ExtensionRunner, [ext], ctx);
   await fire(ext, "session_start", ctx);
   return { ext, ctx, runner };
-}
-
-function skillSet({ quoted = false, hidden = false, bashPaths = false } = {}) {
-  return Array.from({ length: 4 }, (_, i) => makeSkill({
-    name: i === 3 ? "deploy-alias" : `skill-${i}`,
-    description: (`Invoke when the user asks for ${quoted ? '"safe deployment"' : "safe deployment"} and preserve important safety prerequisites. `).repeat(4),
-    filePath: i === 0
-      ? "/audit/skills/flat-file.md"
-      : i === 3
-        ? "/audit/skills/folder-other/SKILL.md"
-        : `/audit/skills/folder-${i}/SKILL.md`,
-    disableModelInvocation: hidden && i === 1,
-  }));
-}
-
-function injectAvailableSkillsInner(prompt, transformInner) {
-  const re = /<available_skills>([\s\S]*?)<\/available_skills>/;
-  const m = prompt.match(re);
-  assert.ok(m, "expected available_skills block");
-  const next = `<available_skills>${transformInner(m[1])}</available_skills>`;
-  return prompt.slice(0, m.index) + next + prompt.slice(m.index + m[0].length);
-}
-
-/** Skills whose XML-trimmed fields match the objects, so compact can recognize the template. */
-function compactableSkillSet() {
-  return Array.from({ length: 4 }, (_, i) => makeSkill({
-    name: i === 3 ? "deploy-alias" : `skill-${i}`,
-    description: "Invoke when the user asks for safe deployment and preserve important safety prerequisites.",
-    filePath: i === 0
-      ? "/audit/skills/flat-file.md"
-      : i === 3
-        ? "/audit/skills/folder-other/SKILL.md"
-        : `/audit/skills/folder-${i}/SKILL.md`,
-  }));
 }
 
 // ── F09: importing pure helpers / factory must not mutate process.env ──
@@ -133,15 +94,6 @@ function compactableSkillSet() {
   ok("F01 prior-extension rules and later updates both survive");
 }
 
-{
-  process.env.PI_CACHE_GUARD_NO_PROMPT_REWRITE = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "deprecated-nop-rewrite");
-  const second = await promptThrough(runner, "NEW_RULE_AFTER_DEPRECATED_FLAG");
-  assert.equal(second, "NEW_RULE_AFTER_DEPRECATED_FLAG");
-  delete process.env.PI_CACHE_GUARD_NO_PROMPT_REWRITE;
-  ok("deprecated NO_PROMPT_REWRITE does not restore freeze");
-}
-
 // ── F03: project_instructions stay intact; no bare-content hoist ──
 {
   const { runner } = await fresh();
@@ -175,208 +127,17 @@ function compactableSkillSet() {
   ok("F11 session-overview content kept on first and later turns");
 }
 
-// ── Skills: default pass-through; opt-in compact is lossless ──
+// ── Skills: default pass-through (no skill XML rewrite) ──
 {
   const { runner } = await fresh();
-  const skills = skillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const out = await promptThrough(runner, base, opts);
+  const base = "BASE\n<available_skills>\n  <skill>\n    <name>deploy-alias</name>\n    <description>Invoke when the user asks for safe deployment and preserve important safety prerequisites.</description>\n    <location>/audit/skills/flat-file.md</location>\n  </skill>\n</available_skills>";
+  const out = await promptThrough(runner, base);
   assert.equal(out, base);
   assert.ok(out.includes("<available_skills>"));
   assert.ok(out.includes("important safety prerequisites"));
   assert.ok(out.includes("/audit/skills/flat-file.md"));
   assert.ok(out.includes("deploy-alias"));
   ok("default mode does not compress skills");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-compact");
-  const skills = skillSet({ quoted: true });
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const out = await promptThrough(runner, base, opts);
-  assert.ok(out.includes("important safety prerequisites") || out.includes("safe deployment"));
-  assert.ok(out.includes("/audit/skills/flat-file.md"));
-  assert.ok(out.includes("deploy-alias"));
-  assert.ok(out.includes("/audit/skills/folder-other/SKILL.md"));
-  assert.ok(!out.includes("/audit/skill-0/SKILL.md"));
-  assert.match(out, /Use the read tool to load a skill's file/);
-  assert.ok(out.includes("<available_skills>"));
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("opt-in skill compact keeps name/description/real path/read guidance");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-compact-bash");
-  const skills = skillSet();
-  const opts = { cwd: "/audit", selectedTools: ["bash"], skills };
-  const base = buildSystemPrompt(opts);
-  const out = await promptThrough(runner, base, opts);
-  if (base.includes("<available_skills>")) {
-    assert.ok(out.includes("/audit/skills/flat-file.md"));
-    if (base.includes("Use bash to load")) {
-      assert.match(out, /Use bash to load a skill's file/);
-    }
-  } else {
-    assert.equal(out, base);
-  }
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact preserves bash-only prologue or passes through");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-compact-hidden");
-  const skills = skillSet({ hidden: true });
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const out = await promptThrough(runner, base, opts);
-  const hiddenName = skills[1].name;
-  const hiddenPath = "/audit/skills/folder-1/SKILL.md";
-  function assertNoHidden(text, label) {
-    assert.ok(!text.includes(hiddenName), `${label} must not contain hidden skill name ${hiddenName}`);
-    assert.ok(!text.includes(hiddenPath), `${label} must not contain hidden skill path ${hiddenPath}`);
-  }
-  assertNoHidden(out, "compact output");
-  assert.ok(!base.includes(`<name>${hiddenName}</name>`));
-  const smuggled = `${out}\n${hiddenName}\n${hiddenPath}`;
-  assert.throws(
-    () => assertNoHidden(smuggled, "smuggled output"),
-    /must not contain hidden skill/,
-  );
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("hidden skills stay out of compact output");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-unknown");
-  const unknown = "CUSTOM\n<available_skills>\n  <mystery>nope</mystery>\n</available_skills>";
-  const out = await promptThrough(runner, unknown, { cwd: "/audit", skills: skillSet() });
-  assert.equal(out, unknown);
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("unrecognized skill template is passed through");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-recognized-compact");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const incoming = buildSystemPrompt(opts);
-  const out = await promptThrough(runner, incoming, opts);
-  assert.notEqual(out, incoming);
-  assert.match(out, /<skill name="skill-0"/);
-  assert.ok(out.includes('description="Invoke when the user asks for safe deployment and preserve important safety prerequisites."'));
-  assert.ok(out.includes('location="/audit/skills/flat-file.md"'));
-  assert.ok(out.includes("deploy-alias"));
-  assert.ok(out.includes("/audit/skills/folder-other/SKILL.md"));
-  assert.match(out, /Use the read tool to load a skill's file/);
-  assert.ok(!out.includes("<location>"));
-  const names = [...out.matchAll(/<skill name="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(names, ["skill-0", "skill-1", "skill-2", "deploy-alias"]);
-  const pre = incoming.slice(0, incoming.indexOf("<available_skills>"));
-  const post = incoming.slice(incoming.indexOf("</available_skills>") + "</available_skills>".length);
-  assert.ok(out.startsWith(pre));
-  assert.ok(out.endsWith(post));
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact rewrites fully recognized templates without dropping prefix/order/paths");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-extra-before");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const incoming = injectAvailableSkillsInner(base, (inner) => `\n  EXTRA_NOTE_BEFORE: keep this policy text.\n${inner}`);
-  const out = await promptThrough(runner, incoming, opts);
-  assert.equal(out, incoming);
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact passes through extra notes before skill items");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-extra-after");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const incoming = injectAvailableSkillsInner(base, (inner) => `${inner}  EXTRA_NOTE_AFTER: keep trailing policy.\n`);
-  const out = await promptThrough(runner, incoming, opts);
-  assert.equal(out, incoming);
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact passes through extra notes after skill items");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-extra-between");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const incoming = injectAvailableSkillsInner(base, (inner) => {
-    const idx = inner.indexOf("</skill>");
-    assert.ok(idx >= 0);
-    const at = idx + "</skill>".length;
-    return `${inner.slice(0, at)}\n  BETWEEN_ITEMS: keep interstitial policy.\n${inner.slice(at)}`;
-  });
-  const out = await promptThrough(runner, incoming, opts);
-  assert.equal(out, incoming);
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact passes through extra notes between skill items");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-unknown-node");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const incoming = injectAvailableSkillsInner(base, (inner) => `\n  <custom_policy>keep-unknown-node</custom_policy>\n${inner}`);
-  const out = await promptThrough(runner, incoming, opts);
-  assert.equal(out, incoming);
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact passes through unknown XML nodes");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-comment");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const incoming = injectAvailableSkillsInner(base, (inner) => `\n  <!-- keep-this-comment: unknown -->\n${inner}`);
-  const out = await promptThrough(runner, incoming, opts);
-  assert.equal(out, incoming);
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact passes through comments and unrecognized non-whitespace");
-}
-
-{
-  process.env.PI_CACHE_GUARD_SKILL_COMPACT = "1";
-  const { runner } = await fresh(mockContext(), guardianFactory, "skill-whitespace-only");
-  const skills = compactableSkillSet();
-  const opts = { cwd: "/audit", selectedTools: ["read"], skills };
-  const base = buildSystemPrompt(opts);
-  const incoming = injectAvailableSkillsInner(base, (inner) => `\n\n${inner}\n\n`);
-  const out = await promptThrough(runner, incoming, opts);
-  assert.notEqual(out, incoming);
-  assert.match(out, /<skill name="/);
-  assert.ok(out.includes("/audit/skills/flat-file.md"));
-  assert.ok(out.includes("deploy-alias"));
-  assert.ok(out.includes("/audit/skills/folder-other/SKILL.md"));
-  assert.match(out, /Use the read tool to load a skill's file/);
-  assert.ok(!out.includes("<location>"));
-  const pre = incoming.slice(0, incoming.indexOf("<available_skills>"));
-  const post = incoming.slice(incoming.indexOf("</available_skills>") + "</available_skills>".length);
-  assert.ok(out.startsWith(pre));
-  assert.ok(out.endsWith(post));
-  delete process.env.PI_CACHE_GUARD_SKILL_COMPACT;
-  ok("skill compact still rewrites recognized whitespace-only templates");
 }
 
 // ── F05 / F06: 400 does not change next payload; keys/retention not overwritten ──
@@ -404,21 +165,6 @@ function compactableSkillSet() {
   assert.equal(payload.system[0].cache_control.ttl, "1h");
   assert.equal(payload.messages[0].content[0].cache_control.ttl, "1h");
   ok("F05 400 does not rewrite Anthropic TTL on system or messages");
-}
-
-{
-  process.env.PI_CACHE_GUARD_STRIP_RETENTION = "1";
-  const { ext, ctx, runner } = await fresh(mockContext(), guardianFactory, "strip-retention");
-  const payload = { prompt_cache_retention: "24h", prompt_cache_key: "keep-me", other: 1 };
-  await runner.emitBeforeProviderRequest(payload);
-  assert.equal("prompt_cache_retention" in payload, false);
-  assert.equal(payload.prompt_cache_key, "keep-me");
-  await ext.commands.get("cache-guardian").handler("disable", ctx);
-  const payload2 = { prompt_cache_retention: "24h" };
-  await runner.emitBeforeProviderRequest(payload2);
-  assert.equal(payload2.prompt_cache_retention, "24h");
-  delete process.env.PI_CACHE_GUARD_STRIP_RETENTION;
-  ok("STRIP_RETENTION only drops legacy field and is inert when disabled");
 }
 
 // ── F02: instance state isolation, 3 interleaved rounds ──
@@ -460,7 +206,7 @@ function compactableSkillSet() {
   assert.equal(b.ctx.entries.length, 3);
   assert.equal(a.ctx.entries[2][1].input, 30);
   assert.equal(b.ctx.entries[2][1].input, 9);
-  await a.ext.commands.get("cache-guardian").handler("disable", a.ctx);
+  await a.ext.commands.get("cache-stats").handler("disable", a.ctx);
   const bAfterADisable = await promptThrough(b.runner, "SESSION_B_STILL_ON");
   assert.equal(bAfterADisable, "SESSION_B_STILL_ON");
   await fire(a.ext, "turn_end", a.ctx, {
@@ -490,21 +236,21 @@ function compactableSkillSet() {
   ctx.mode = "print";
   const { ext } = await fresh(ctx);
   ctx.footers.length = 0;
-  await ext.commands.get("cache-guardian").handler("enable", ctx);
+  await ext.commands.get("cache-stats").handler("enable", ctx);
   assert.equal(ctx.footers.length, 0);
   ok("F12 enable in print mode does not install footer");
 }
 
 {
-  process.env.PI_CACHE_GUARD_FOOTER = "0";
+  process.env.PI_CACHE_STATS_FOOTER = "0";
   const ctx = mockContext();
   ctx.mode = "tui";
   const { ext } = await fresh(ctx, guardianFactory, "no-footer");
   ctx.footers.length = 0;
-  await ext.commands.get("cache-guardian").handler("enable", ctx);
+  await ext.commands.get("cache-stats").handler("enable", ctx);
   assert.equal(ctx.footers.length, 0);
-  delete process.env.PI_CACHE_GUARD_FOOTER;
-  ok("F12 enable respects PI_CACHE_GUARD_FOOTER=0");
+  delete process.env.PI_CACHE_STATS_FOOTER;
+  ok("F12 enable respects PI_CACHE_STATS_FOOTER=0");
 }
 
 {
@@ -513,7 +259,7 @@ function compactableSkillSet() {
   const { ext } = await fresh(ctx);
   assert.equal(typeof ctx.footers.at(-1), "function");
   ctx.footers.length = 0;
-  const ret = ext.commands.get("cache-guardian").handler("disable", ctx);
+  const ret = ext.commands.get("cache-stats").handler("disable", ctx);
   assert.equal(typeof ret.then, "function");
   await ret;
   assert.equal(ctx.footers.at(-1), undefined);
@@ -530,7 +276,7 @@ function compactableSkillSet() {
   });
   assert.equal(ctx.entries.length, 0);
   ctx.mode = "tui";
-  await ext.commands.get("cache-guardian").handler("enable", ctx);
+  await ext.commands.get("cache-stats").handler("enable", ctx);
   assert.equal(typeof ctx.footers.at(-1), "function");
   ok("F12 disable stops footer/stats; enable reinstalls in TUI");
 }
@@ -573,20 +319,9 @@ function compactableSkillSet() {
       }
     },
   }});
-  await ext.commands.get("cache-guardian").handler("reset", ctx);
+  await ext.commands.get("cache-stats").handler("reset", ctx);
   assert.ok(ctx.notices.some((n) => String(n[0]).includes("reset")));
   ok("F12 stats aggregate all assistant usage; reset notifies");
-}
-
-{
-  process.env.PI_CACHE_GUARD = "1";
-  const g = await fresh(mockContext(), guardianFactory, "guard");
-  await g.ext.commands.get("cache-guardian").handler("disable", g.ctx);
-  g.ctx.notices.length = 0;
-  await fire(g.ext, "session_shutdown", g.ctx);
-  assert.equal(g.ctx.notices.length, 0);
-  delete process.env.PI_CACHE_GUARD;
-  ok("F12 disable suppresses shutdown guard warnings");
 }
 
 {
@@ -615,7 +350,7 @@ function compactableSkillSet() {
     });
   }
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   const stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Turns: 55/);
   assert.match(stats, /input=55/);
@@ -629,69 +364,6 @@ function compactableSkillSet() {
   assert.equal(cacheHitPct({ input: 200, cacheRead: 800, cacheWrite: 0 }), 80);
   assert.equal(aggregateHit(1600, 2050), 78);
   ok("net-input weighted hit formula unchanged");
-}
-
-// ── old-version对照: 244e8c7 freeze is caught by F01 assertion ──
-{
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "guardian-fix-old-"));
-  const oldPath = path.join(tmp, "cache-guardian.ts");
-  const gitRoot = fs.existsSync(path.join(REPO_ROOT, ".git"))
-    ? REPO_ROOT
-    : "/root/workspace/pi-cache-guardian";
-  const shown = spawnSync("git", ["show", "244e8c7:extensions/cache-guardian.ts"], {
-    cwd: gitRoot,
-    encoding: "utf8",
-  });
-  assert.equal(shown.status, 0, shown.stderr);
-  fs.writeFileSync(oldPath, shown.stdout);
-  fs.writeFileSync(path.join(tmp, "package.json"), JSON.stringify({ type: "module" }) + "\n");
-  const nmCandidates = [
-    path.join(REPO_ROOT, "node_modules"),
-    path.join(REPO_ROOT, "..", "node_modules"),
-    path.join(gitRoot, "node_modules"),
-  ];
-  const nm = nmCandidates.find((p) => fs.existsSync(p));
-  assert.ok(nm, "node_modules for old-version probe");
-  fs.symlinkSync(nm, path.join(tmp, "node_modules"));
-  const probe = `
-    import { ExtensionRunner } from ${JSON.stringify(pathToFileURL(path.join(loaded.dist, "index.js")).href)};
-    const { default: factory } = await import(${JSON.stringify(pathToFileURL(oldPath).href)});
-    const handlers = new Map();
-    factory({
-      on: (e, fn) => handlers.set(e, [...(handlers.get(e) ?? []), fn]),
-      registerCommand: () => {},
-    });
-    const ctx = {
-      mode: "print",
-      model: { api: "openai-completions", provider: "x", id: "y", name: "n" },
-      sessionManager: { getSessionId: () => "s", appendCustomEntry() {} },
-      getContextUsage: () => undefined,
-      ui: { notify() {}, setFooter() {} },
-    };
-    const ext = { path: "old", handlers, commands: new Map() };
-    const runner = new ExtensionRunner([ext], { assertActive() {} }, "/tmp", ctx.sessionManager, {});
-    runner.createContext = () => ctx;
-    runner.emitError = (e) => { throw new Error(JSON.stringify(e)); };
-    for (const h of handlers.get("session_start") ?? []) await h({ type: "session_start" }, ctx);
-    const first = await runner.emitBeforeAgentStart("p", undefined, "OLD_POLICY", { cwd: "/tmp" });
-    const second = await runner.emitBeforeAgentStart("p", undefined, "NEW_READONLY_POLICY", { cwd: "/tmp" });
-    const got = second?.systemPrompt ?? "NEW_READONLY_POLICY";
-    if (got.includes("NEW_READONLY_POLICY")) {
-      console.error("old version unexpectedly kept new policy");
-      process.exit(0);
-    }
-    console.error("OLD_FREEZE_CAUGHT");
-    process.exit(2);
-  `;
-  const probeFile = path.join(tmp, "probe.mjs");
-  fs.writeFileSync(probeFile, probe);
-  const oldRun = spawnSync(process.execPath, [probeFile], {
-    encoding: "utf8",
-    env: { ...process.env, PI_CACHE_GUARD_FOOTER: "0" },
-  });
-  assert.equal(oldRun.status, 2, `old version should fail F01; status=${oldRun.status} out=${oldRun.stdout} err=${oldRun.stderr}`);
-  assert.match(oldRun.stderr, /OLD_FREEZE_CAUGHT/);
-  ok("old 244e8c7 freeze is caught by F01 assertion");
 }
 
 // ── OpenAI style usage in agent_end (prompt_tokens / completion_tokens / total_tokens) ──
@@ -723,7 +395,7 @@ function compactableSkillSet() {
 
   // Check stats command output
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   const stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /input=1200/);
   assert.match(stats, /output=300/);
@@ -763,7 +435,7 @@ function compactableSkillSet() {
   assert.equal(assistantMsg.usage.cacheWrite, 0);
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   const stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /input=200/);
   assert.match(stats, /output=80/);
@@ -917,7 +589,7 @@ function compactableSkillSet() {
   assert.match(renderedToolEnd, /▲ 60%\/131K/);
 
   // 4. disabled state ignores turn_end and tool execution events
-  await ext.commands.get("cache-guardian").handler("disable", ctx);
+  await ext.commands.get("cache-stats").handler("disable", ctx);
   renderCount = 0;
   await fire(ext, "turn_end", ctx, {
     turnIndex: 1,
@@ -1118,9 +790,9 @@ function compactableSkillSet() {
   assert.equal((cachedLine.match(/\[WARN:/g) || []).length, 1, "warning color is reserved for the ◇ slot");
   assert.equal(getEntriesCalls, 5);
 
-  // 6. /cache-guardian reset -> watermark set to 3 entries -> footer n/a
+  // 6. /cache-stats reset -> watermark set to 3 entries -> footer n/a
   //    (reset handler reads getEntries once, then render misses the epoch bump)
-  await ext.commands.get("cache-guardian").handler("reset", ctx);
+  await ext.commands.get("cache-stats").handler("reset", ctx);
   assert.equal(getEntriesCalls, 6);
   const resetLine = footerComponent.render(120)[0];
   assert.match(resetLine, /\[DIM:n\/a\]/);
@@ -1139,7 +811,7 @@ function compactableSkillSet() {
   // 8. Second reset -> watermark at 4 entries; the post-reset window never shows a
   //    cache interaction, so ◆ and ◇ are both n/a. The round is measurable (input
   //    1000), but the narrowed gate keeps a cache-free window at n/a — no warning 0%.
-  await ext.commands.get("cache-guardian").handler("reset", ctx);
+  await ext.commands.get("cache-stats").handler("reset", ctx);
   assert.equal(getEntriesCalls, 9);
   sessionEntries.push({
     type: "message",
@@ -1164,11 +836,10 @@ function compactableSkillSet() {
   ok("Footer gates ◆/◇ on a cache interaction (n/a while absent, 0% after a miss), applies reset watermark, caches unchanged renders");
 }
 
-// ── Footer ◆/◇ vs /cache-guardian output: the command's Session aggregate is the
+// ── Footer ◆/◇ vs /cache-stats output: the command's Session aggregate is the
 //    same all-session scan the footer's ◆ renders; both stay n/a while the
 //    session never showed a cache interaction, and ◇ shows 0% after a miss ──
 {
-  delete process.env.PI_CACHE_GUARD; // keep the command output free of guard lines
   const sessionEntries = [];
   const notices = [];
   let footerComponent = null;
@@ -1209,7 +880,7 @@ function compactableSkillSet() {
 
   const commandStats = async () => {
     notices.length = 0;
-    await ext.commands.get("cache-guardian").handler("", ctx);
+    await ext.commands.get("cache-stats").handler("", ctx);
     return notices.map((n) => n[0]).join("\n");
   };
 
@@ -1277,7 +948,7 @@ function compactableSkillSet() {
   });
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   const stats = ctx.notices.map((n) => n[0]).join("\n");
   // Session aggregate: (500+0)/(500+500+1000+0) = 500/2000 = 25%
   assert.match(stats, /Session aggregate: 25%/);
@@ -1367,7 +1038,7 @@ function compactableSkillSet() {
   });
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   const stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Aggregate hit: 100%  \(current run; read=500 \/ denom=500\)/);
   assert.match(stats, /Session aggregate: 88%  \(all session, footer scope; read=1750 \/ denom=2000\)/);
@@ -1383,208 +1054,11 @@ function compactableSkillSet() {
   });
   const { ext: ext2 } = await fresh(printCtx);
   printCtx.notices.length = 0;
-  await ext2.commands.get("cache-guardian").handler("", printCtx);
+  await ext2.commands.get("cache-stats").handler("", printCtx);
   const stats2 = printCtx.notices.map((n) => n[0]).join("\n");
   assert.match(stats2, /Session aggregate: 88%/);
 
   ok("Command prints both current-run and all-session (footer) aggregates");
-}
-
-// ── Cache guard: any-breach alert (current run first, then all-session) ──
-// ② current run high + all-session low -> warn via the all-session fallback branch
-{
-  process.env.PI_CACHE_GUARD = "1";
-  const lowSessionEntries = [
-    { type: "message", message: { role: "assistant", usage: { input: 1000, cacheRead: 100, cacheWrite: 0 } } },
-  ];
-  const ctx = mockContext({
-    sessionManager: {
-      getSessionId: () => "test-session",
-      appendCustomEntry: () => {},
-      getEntries: () => lowSessionEntries,
-    },
-  });
-  const { ext } = await fresh(ctx);
-  // Current run is 95% (high), so the current-run branch skips; the all-session
-  // aggregate is 9% (low) and must still warn (any breach alerts).
-  await fire(ext, "turn_end", ctx, {
-    turnIndex: 0,
-    message: { role: "assistant", usage: { input: 100, cacheRead: 1900, cacheWrite: 0 } },
-    toolResults: [],
-  });
-  await fire(ext, "agent_end", ctx, {
-    messages: [{ role: "assistant", usage: { input: 100, cacheRead: 1900, cacheWrite: 0 } }],
-  });
-  ctx.notices.length = 0;
-  await fire(ext, "session_shutdown", ctx);
-  const warns = ctx.notices.filter((n) => String(n[0]).includes("Cache guard"));
-  assert.equal(warns.length, 1, "guard must warn once when all-session aggregate is below threshold");
-  const msg = String(warns[0][0]);
-  assert.match(msg, /session aggregate=9%/);
-  assert.ok(!msg.includes("current run"), "this is the all-session branch, so no current-run text");
-  delete process.env.PI_CACHE_GUARD;
-  ok("Guard: current run high + all-session low -> warns via all-session branch");
-}
-
-// ① current run low + all-session high -> warn via the current-run branch, text has both numbers
-{
-  process.env.PI_CACHE_GUARD = "1";
-  const highSessionEntries = [
-    { type: "message", message: { role: "assistant", usage: { input: 50, cacheRead: 950, cacheWrite: 0 } } }, // 95%
-  ];
-  const ctx = mockContext({
-    sessionManager: {
-      getSessionId: () => "test-session",
-      appendCustomEntry: () => {},
-      getEntries: () => highSessionEntries,
-    },
-  });
-  const { ext } = await fresh(ctx);
-  // Current run is 50% (low); a resumed long session's historical high (95%)
-  // must not dilute this regression away.
-  await fire(ext, "turn_end", ctx, {
-    turnIndex: 0,
-    message: { role: "assistant", usage: { input: 500, cacheRead: 500, cacheWrite: 0 } },
-    toolResults: [],
-  });
-  await fire(ext, "agent_end", ctx, {
-    messages: [{ role: "assistant", usage: { input: 500, cacheRead: 500, cacheWrite: 0 } }],
-  });
-  ctx.notices.length = 0;
-  await fire(ext, "session_shutdown", ctx);
-  const warns = ctx.notices.filter((n) => String(n[0]).includes("Cache guard"));
-  assert.equal(warns.length, 1, "guard must warn when current run is below threshold");
-  const msg = String(warns[0][0]);
-  assert.match(msg, /current run hit=50%/);
-  assert.match(msg, /session aggregate=95%/);
-  delete process.env.PI_CACHE_GUARD;
-  ok("Guard: current run low + all-session high -> warns with both numbers");
-}
-
-// ③ current run high + all-session high -> silent
-{
-  process.env.PI_CACHE_GUARD = "1";
-  const highSessionEntries = [
-    { type: "message", message: { role: "assistant", usage: { input: 50, cacheRead: 950, cacheWrite: 0 } } }, // 95%
-  ];
-  const ctx = mockContext({
-    sessionManager: {
-      getSessionId: () => "test-session",
-      appendCustomEntry: () => {},
-      getEntries: () => highSessionEntries,
-    },
-  });
-  const { ext } = await fresh(ctx);
-  await fire(ext, "turn_end", ctx, {
-    turnIndex: 0,
-    message: { role: "assistant", usage: { input: 100, cacheRead: 1900, cacheWrite: 0 } },
-    toolResults: [],
-  });
-  await fire(ext, "agent_end", ctx, {
-    messages: [{ role: "assistant", usage: { input: 100, cacheRead: 1900, cacheWrite: 0 } }],
-  });
-  ctx.notices.length = 0;
-  await fire(ext, "session_shutdown", ctx);
-  const warns = ctx.notices.filter((n) => String(n[0]).includes("Cache guard"));
-  assert.equal(warns.length, 0, "guard must stay silent when current run and all-session are both above threshold");
-  delete process.env.PI_CACHE_GUARD;
-  ok("Guard: current run high + all-session high -> silent");
-}
-
-{
-  process.env.PI_CACHE_GUARD = "1";
-  const noCacheSession = [
-    { type: "message", message: { role: "assistant", usage: { input: 1000, cacheRead: 0, cacheWrite: 0 } } },
-  ];
-  const ctx = mockContext({
-    sessionManager: {
-      getSessionId: () => "test-session",
-      appendCustomEntry: () => {},
-      getEntries: () => noCacheSession,
-    },
-  });
-  const { ext } = await fresh(ctx);
-  // Current run is 100% (high) and session scope has no cache (n/a): no breach, so
-  // the guard stays silent (matches the footer's n/a, never a fabricated 0%).
-  await fire(ext, "turn_end", ctx, {
-    turnIndex: 0,
-    message: { role: "assistant", usage: { input: 0, cacheRead: 500, cacheWrite: 0 } },
-    toolResults: [],
-  });
-  await fire(ext, "agent_end", ctx, {
-    messages: [{ role: "assistant", usage: { input: 0, cacheRead: 500, cacheWrite: 0 } }],
-  });
-  ctx.notices.length = 0;
-  await fire(ext, "session_shutdown", ctx);
-  const warns = ctx.notices.filter((n) => String(n[0]).includes("Cache guard"));
-  assert.equal(warns.length, 0, "guard must not warn when current run is high and session scope has no cache usage");
-  delete process.env.PI_CACHE_GUARD;
-  ok("Guard stays silent when all-session aggregate is n/a and current run is high");
-}
-
-// ④ all-session n/a + current run low -> warn via the current-run branch (text shows both)
-{
-  process.env.PI_CACHE_GUARD = "1";
-  const noCacheSession = [
-    { type: "message", message: { role: "assistant", usage: { input: 1000, cacheRead: 0, cacheWrite: 0 } } },
-  ];
-  const ctx = mockContext({
-    sessionManager: {
-      getSessionId: () => "test-session",
-      appendCustomEntry: () => {},
-      getEntries: () => noCacheSession,
-    },
-  });
-  const { ext } = await fresh(ctx);
-  // Current run is 30% (low) while the all-session scope has no cache (n/a): the
-  // current-run branch must fire (it is what the guard is designed to catch).
-  await fire(ext, "turn_end", ctx, {
-    turnIndex: 0,
-    message: { role: "assistant", usage: { input: 700, cacheRead: 300, cacheWrite: 0 } },
-    toolResults: [],
-  });
-  await fire(ext, "agent_end", ctx, {
-    messages: [{ role: "assistant", usage: { input: 700, cacheRead: 300, cacheWrite: 0 } }],
-  });
-  ctx.notices.length = 0;
-  await fire(ext, "session_shutdown", ctx);
-  const warns = ctx.notices.filter((n) => String(n[0]).includes("Cache guard"));
-  assert.equal(warns.length, 1, "guard must warn when current run is low even if all-session is n/a");
-  const msg = String(warns[0][0]);
-  assert.match(msg, /current run hit=30%/);
-  assert.match(msg, /session aggregate=n\/a/);
-  delete process.env.PI_CACHE_GUARD;
-  ok("Guard: all-session n/a + current run low -> warns via current-run branch");
-}
-
-// ⑤ current run n/a + all-session n/a -> silent
-{
-  process.env.PI_CACHE_GUARD = "1";
-  const noCacheSession = [
-    { type: "message", message: { role: "assistant", usage: { input: 1000, cacheRead: 0, cacheWrite: 0 } } },
-  ];
-  const ctx = mockContext({
-    sessionManager: {
-      getSessionId: () => "test-session",
-      appendCustomEntry: () => {},
-      getEntries: () => noCacheSession,
-    },
-  });
-  const { ext } = await fresh(ctx);
-  await fire(ext, "turn_end", ctx, {
-    turnIndex: 0,
-    message: { role: "assistant", usage: { input: 1000, cacheRead: 0, cacheWrite: 0 } },
-    toolResults: [],
-  });
-  await fire(ext, "agent_end", ctx, {
-    messages: [{ role: "assistant", usage: { input: 1000, cacheRead: 0, cacheWrite: 0 } }],
-  });
-  ctx.notices.length = 0;
-  await fire(ext, "session_shutdown", ctx);
-  const warns = ctx.notices.filter((n) => String(n[0]).includes("Cache guard"));
-  assert.equal(warns.length, 0, "guard must stay silent when neither scope has cache data");
-  delete process.env.PI_CACHE_GUARD;
-  ok("Guard: both current run and all-session n/a -> silent");
 }
 
 // ── Session aggregate label reflects reset state: after /reset, footer is a
@@ -1604,14 +1078,14 @@ function compactableSkillSet() {
 
   // Before reset: footerResetBaseline is null -> label says "footer scope"
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   let stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Session aggregate: 90%  \(all session, footer scope; read=900 \/ denom=1000\)/);
 
   // After reset: footerResetBaseline is set -> label says footer is post-reset window
-  await ext.commands.get("cache-guardian").handler("reset", ctx);
+  await ext.commands.get("cache-stats").handler("reset", ctx);
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Session aggregate: 90%  \(all session, footer currently post-reset window; read=900 \/ denom=1000\)/);
   ok("Session aggregate label switches to post-reset wording after /reset");
@@ -1634,12 +1108,13 @@ function compactableSkillSet() {
   });
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   const stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Cumulative: input=150  output=0  cacheRead=350  cacheWrite=50/);
   assert.match(stats, /read=350 \/ denom=550/);
   assert.match(stats, /Turns: 1/);
   assert.equal(ctx.entries.length, 1);
+  assert.equal(ctx.entries[0][0], "cache-stats-turn");
   assert.deepEqual(ctx.entries[0][1], {
     turn: 1,
     input: 150,
@@ -1674,7 +1149,7 @@ function compactableSkillSet() {
   });
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   let stats = ctx.notices.map((n) => n[0]).join("\n");
   // Total: input=150, cacheRead=350, cacheWrite=50, denom=550
   assert.match(stats, /Cumulative: input=150  output=0  cacheRead=350  cacheWrite=50/);
@@ -1686,7 +1161,7 @@ function compactableSkillSet() {
   });
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   stats = ctx.notices.map((n) => n[0]).join("\n");
   // Still exactly 150/350/50, not doubled
   assert.match(stats, /Cumulative: input=150  output=0  cacheRead=350  cacheWrite=50/);
@@ -1721,7 +1196,7 @@ function compactableSkillSet() {
   await fire(ext, "agent_end", ctx, { messages: [] });
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   let stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Turns: 2/);
   assert.match(stats, /Cumulative: input=100  output=0  cacheRead=400  cacheWrite=0/);
@@ -1738,7 +1213,7 @@ function compactableSkillSet() {
   });
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Turns: 3/);
   assert.match(stats, /Cumulative: input=150  output=0  cacheRead=500  cacheWrite=0/);
@@ -1798,7 +1273,7 @@ function compactableSkillSet() {
   assert.deepEqual(renderCalls, [true], "thinking_level_select must call force=true requestRender()");
 
   renderCalls.length = 0;
-  await ext.commands.get("cache-guardian").handler("reset", ctx);
+  await ext.commands.get("cache-stats").handler("reset", ctx);
   assert.deepEqual(renderCalls, [true], "reset command must call force=true requestRender()");
 
   ok("Regression render throttling: unforced vs force=true properly dispatched");
@@ -1829,7 +1304,7 @@ function compactableSkillSet() {
   });
 
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   const stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Cumulative: input=100  output=50  cacheRead=200  cacheWrite=0/);
   assert.equal(ctx.entries.length, 1);
@@ -1869,48 +1344,16 @@ function compactableSkillSet() {
     hitPct: 75,
   });
 
-  // 2. fallback accumulates to snapshot so current-run aggregate and
-  //    session_shutdown guard can read this turn's data (Low-2 fix).
+  // 2. fallback accumulates to snapshot so current-run aggregate
+  //    can read this turn's data (Low-2 fix).
   ctx.notices.length = 0;
-  await ext.commands.get("cache-guardian").handler("", ctx);
+  await ext.commands.get("cache-stats").handler("", ctx);
   const stats = ctx.notices.map((n) => n[0]).join("\n");
   assert.match(stats, /Turns: 1/);
   assert.match(stats, /Cumulative: input=120  output=0  cacheRead=360  cacheWrite=0/);
   assert.match(stats, /Aggregate hit: 75%  \(current run; read=360 \/ denom=480\)/);
 
-  ok("Regression: agent_end fallback accumulates to snapshot for current-run aggregate and guard");
-}
-
-// ── Regression (Low-2): session_shutdown guard can read fallback-accumulated
-//    data when liveRun was empty and only event.messages provided the usage ──
-{
-  process.env.PI_CACHE_GUARD = "1";
-  // No session entries: all-session aggregate is n/a
-  const ctx = mockContext({
-    sessionManager: {
-      getSessionId: () => "test-session",
-      appendCustomEntry: () => {},
-      getEntries: () => [],
-    },
-  });
-  const { ext } = await fresh(ctx);
-
-  // Only agent_end fires (no turn_end), liveRun is empty, fallback extracts
-  // usage from event.messages: input=100, cacheRead=100, cacheWrite=0, denom=200
-  await fire(ext, "agent_start", ctx);
-  await fire(ext, "agent_end", ctx, {
-    messages: [{ role: "assistant", usage: { input: 100, cacheRead: 100, cacheWrite: 0 } }],
-  });
-
-  ctx.notices.length = 0;
-  await fire(ext, "session_shutdown", ctx);
-  const warns = ctx.notices.filter((n) => String(n[0]).includes("Cache guard"));
-  // current-run aggregate = 100/(100+100) = 50%, below default threshold 90% -> must warn
-  assert.equal(warns.length, 1, "guard must warn when fallback data is accumulated to snapshot");
-  const msg = String(warns[0][0]);
-  assert.match(msg, /current run hit=50%/);
-  delete process.env.PI_CACHE_GUARD;
-  ok("Regression: session_shutdown guard warns on fallback-accumulated current-run data");
+  ok("Regression: agent_end fallback accumulates to snapshot for current-run aggregate");
 }
 
 // ── Regression: liveRun has cacheRead with input=0 (100% cache hit) does NOT trigger agent_end fallback ──
@@ -2079,7 +1522,7 @@ function compactableSkillSet() {
     await fire(ext, "turn_end", ctx, { message: { role: "assistant" } });
     assert.match(footerComponent.render(200)[0], /▸ n\/a/, "assistant without usage must clear to n/a");
 
-    // 7. /cache-guardian reset clears the estimate
+    // 7. /cache-stats reset clears the estimate
     fakeNow = 6_000_000;
     await fire(ext, "before_provider_request", ctx, { payload: {} });
     fakeNow = 6_002_000;
@@ -2087,7 +1530,7 @@ function compactableSkillSet() {
       message: { role: "assistant", usage: { output: 90 } },
     });
     assert.match(footerComponent.render(200)[0], /▸ 45 t\/s/);
-    await ext.commands.get("cache-guardian").handler("reset", ctx);
+    await ext.commands.get("cache-stats").handler("reset", ctx);
     assert.match(footerComponent.render(200)[0], /▸ n\/a/, "reset must clear the TPS estimate");
 
     // 8. session_start (session switch) resets the estimate, no cross-session residue
@@ -2164,7 +1607,340 @@ function compactableSkillSet() {
     });
     assert.match(footerComponent.render(200)[0], /▸ 200 t\/s/, "a new request re-records t0 and estimates again");
 
+    // Turn 4: streaming stamps (firstThinkingAt/firstTextAt/lastDeltaAt/doneAt) are also consumed once.
+    fakeNow = 12_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 12_000_200;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t" } });
+    fakeNow = 12_000_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 12_001_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "b" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 100, reasoning: 20 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 80 t\/s/, "streaming turn estimates from decode window");
+
+    // Turn 5: repeated turn_end with no new streaming stamps or request must render n/a.
+    fakeNow = 12_060_000;
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 100, reasoning: 20 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "consumed streaming stamps must not be reused on a repeated turn_end");
+
     ok("TPS t0 is consumed exactly once per turn; no stale-t0 re-consumption");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 1: TTFT prefill excluded, decode window starts at first non-empty text/toolcall delta (90 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-ttft-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 20_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    // Request starts at t=0, 6s TTFT prefill (empty delta at +5s ignored), 1s decode (t=+6s..+7s) for 90 tokens -> 90 t/s
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 20_005_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "" } });
+    fakeNow = 20_006_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "Hello" } });
+    fakeNow = 20_007_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: " world" } });
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "done" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 500, output: 90 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 90 t\/s/, "TTFT must be excluded so 90 tokens over 1s decode renders 90 t/s");
+
+    // toolcall_delta also starts the decode window when no text_delta precedes it
+    fakeNow = 20_010_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 20_013_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "toolcall_delta", delta: "{\"a\":" } });
+    fakeNow = 20_014_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "toolcall_delta", delta: "1}" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 500, output: 90 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 90 t\/s/, "toolcall_delta must be folded into text decode window (90 t/s)");
+
+    ok("TPS streaming: excludes TTFT prefill and measures from first text/toolcall delta (90 t/s)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 2: pure thinking stream without text_delta uses firstThinkingAt (80 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-thinking-only-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 30_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 30_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "step 1" } });
+    fakeNow = 30_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "step 2" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 100, output: 80, reasoning: 80 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 80 t\/s/, "pure thinking stream must measure output over [firstThinkingAt, end] (80 t/s)");
+    ok("TPS streaming: pure thinking stream uses firstThinkingAt (80 t/s)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 3: thinking + text splits reasoning (100 t/s) or falls back to full window when reasoning is 0 (75 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-split-reasoning-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 40_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    // 3a. canSplitReasoning=true: thinking [1s..2s] (50 reasoning tokens), text [2s..3s] (100 text tokens, total output 150) -> 100 t/s
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 40_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "think" } });
+    fakeNow = 40_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "answer" } });
+    fakeNow = 40_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: " done" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 100, output: 150, completion_tokens_details: { reasoning_tokens: 50 } } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 100 t\/s/, "canSplitReasoning=true must measure (output-reasoning) over [firstTextAt, end] (100 t/s)");
+
+    // 3b. Anthropic-like fallback (reasoning=0): same timestamps [1s..3s] (2s total), output=150, reasoning=0 -> 150 / 2s = 75 t/s
+    fakeNow = 41_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 41_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "think" } });
+    fakeNow = 41_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "answer" } });
+    fakeNow = 41_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: " done" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 100, output: 150 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 75 t\/s/, "missing reasoning tokens must fall back to full [firstThinkingAt, end] window (75 t/s)");
+
+    ok("TPS streaming: canSplitReasoning splits text window (100 t/s) and falls back when reasoning is 0 (75 t/s)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 4: message_end locks doneAt before tool execution so tool latency is excluded (100 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-tool-isolation-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 50_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 50_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "toolcall_delta", delta: "{\"cmd\":" } });
+    fakeNow = 50_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "toolcall_delta", delta: "\"run\"}" } });
+    // agent-loop emits message_end when stream finishes, BEFORE running tools (no message_update type=done)
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    fakeNow = 50_002_100;
+    await fire(ext, "tool_execution_start", ctx, {});
+    fakeNow = 50_011_000; // +9s slow tool execution
+    await fire(ext, "tool_execution_end", ctx, {});
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 100, output: 100 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 100 t\/s/, "tool execution latency after message_end must not dilute TPS (100 t/s)");
+    ok("TPS streaming: message_end locks doneAt before tool execution (100 t/s)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS streaming 5: four sanity guards return n/a on anomalous windows and retry clears partial stamps ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-guards-model" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 60_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+
+    // Guard 1: w < 100ms -> n/a
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 60_000_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 60_000_550; // w = 50ms < 100ms
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 50 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "w < 100ms must fail guard 1 and render n/a");
+
+    // Guard 2: n * 1000 > 10000 * w (> 10,000 t/s) -> n/a
+    fakeNow = 61_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 61_000_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 61_000_600; // w = 100ms
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 1500 } }, // 15,000 t/s
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "tps > 10000 t/s must fail guard 2 and render n/a");
+
+    // Guard 3: flow * 4 < w (active flow < 25% of decode window) -> n/a
+    fakeNow = 62_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 62_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 62_001_200; // lastDeltaAt -> flow = 200ms
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "b" } });
+    fakeNow = 62_002_000; // doneAt -> w = 1000ms, flow*4 = 800 < 1000
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 50 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "flow * 4 < w must fail guard 3 and render n/a");
+
+    // Guard 4: think > 0 && firstText > 0 && n * (firstText - ttft) > 20 * think * w -> n/a
+    fakeNow = 63_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 63_001_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t" } });
+    fakeNow = 63_002_000; // firstText - ttft = 1000ms, reasoning = 10 -> 10 t/s
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 63_002_100; // text window w = 100ms, n = 500 -> 5000 t/s (500 * 1000 > 20 * 10 * 100)
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "b" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 510, reasoning: 10 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "n * (firstText - ttft) > 20 * think * w must fail guard 4 and render n/a");
+
+    // Retry before_provider_request discards half-recorded thinking stamp from aborted attempt
+    fakeNow = 64_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 64_000_500;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "aborted" } });
+    fakeNow = 64_002_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} }); // retry clears streamFirstThinkingAt
+    fakeNow = 64_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "ok" } });
+    fakeNow = 64_004_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "!" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 10, output: 80 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 80 t\/s/, "retry before_provider_request must clear stale partial streaming stamps (80 t/s)");
+
+    ok("TPS streaming: four sanity guards return n/a on anomalous windows and retry clears partial stamps");
   } finally {
     Date.now = realNow;
   }
@@ -2173,12 +1949,301 @@ function compactableSkillSet() {
 // ── Lifecycle: resetRunState/uninstallFooter clear TPS scratch fields ──
 {
   const state = createInstanceState(true);
+  assert.equal(state.streamFirstThinkingAt, null, "createInstanceState initializes streamFirstThinkingAt to null");
+  assert.equal(state.streamFirstTextAt, null, "createInstanceState initializes streamFirstTextAt to null");
+  assert.equal(state.streamLastDeltaAt, null, "createInstanceState initializes streamLastDeltaAt to null");
+  assert.equal(state.streamDoneAt, null, "createInstanceState initializes streamDoneAt to null");
   state.providerRequestStartedAt = 12345;
+  state.streamFirstThinkingAt = 12350;
+  state.streamFirstTextAt = 12360;
+  state.streamLastDeltaAt = 12370;
+  state.streamDoneAt = 12380;
   state.lastTurnTps = "45";
   resetRunState(state);
   assert.equal(state.providerRequestStartedAt, null, "resetRunState must clear providerRequestStartedAt");
+  assert.equal(state.streamFirstThinkingAt, null, "resetRunState must clear streamFirstThinkingAt");
+  assert.equal(state.streamFirstTextAt, null, "resetRunState must clear streamFirstTextAt");
+  assert.equal(state.streamLastDeltaAt, null, "resetRunState must clear streamLastDeltaAt");
+  assert.equal(state.streamDoneAt, null, "resetRunState must clear streamDoneAt");
   assert.equal(state.lastTurnTps, null, "resetRunState must clear lastTurnTps");
   ok("Lifecycle: resetRunState clears TPS scratch fields");
 }
 
-console.log(`All cache-guardian regressions passed (${passed} cases, sdk=${sdkVersion})`);
+// ── TPS oracle audit (a): reasoning == output with text stream returns n/a (not full-window fallback) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-oracle-a" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 70_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 70_001_000; // firstAny = 1000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "think" } });
+    fakeNow = 70_002_000; // firstText = 2000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "text" } });
+    fakeNow = 70_003_000; // end = 3000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "!" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 100, reasoning: 100 } },
+    });
+    assert.equal(
+      computeTurnTps(
+        { firstThinkingAt: 1000, firstTextAt: 2000, lastDeltaAt: 3000, doneAt: 3000 },
+        { role: "assistant", usage: { output: 100, reasoning: 100 } },
+      ),
+      null,
+      "reasoning == output with text stream has n = 0 and must return null",
+    );
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "reasoning == output with text stream must render n/a (not 50 t/s)");
+    ok("TPS oracle (a): reasoning == output with text stream renders n/a");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS oracle audit (b): interleaved stream with text before thinking uses from=firstText, n=output-reasoning (75 t/s) ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-oracle-b" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 71_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 71_002_000; // firstText = 2000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "hello" } });
+    fakeNow = 71_003_000; // firstThinking = 3000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "hmm" } });
+    fakeNow = 71_004_000; // end = 4000
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 200, reasoning: 50 } },
+    });
+    assert.equal(
+      computeTurnTps(
+        { firstTextAt: 2000, firstThinkingAt: 3000, lastDeltaAt: 3000, doneAt: 4000 },
+        { role: "assistant", usage: { output: 200, reasoning: 50 } },
+      ),
+      "75",
+      "interleaved text-before-thinking must measure n=150 over w=2000 -> 75 t/s",
+    );
+    assert.match(footerComponent.render(200)[0], /▸ 75 t\/s/, "interleaved text-before-thinking must render 75 t/s");
+
+    // Non-streaming fallback bit-for-bit check: message_end without streaming deltas must NOT set streamDoneAt
+    fakeNow = 72_000_000;
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 72_001_000;
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    fakeNow = 72_002_000; // turn_end at +2000ms from requestStartedAt
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 90 } },
+    });
+    assert.match(footerComponent.render(200)[0], /▸ 45 t\/s/, "non-streaming fallback must ignore message_end and use turnEndedAt - requestStartedAt (45 t/s)");
+
+    ok("TPS oracle (b): interleaved text-before-thinking renders 75 t/s and non-streaming ignores message_end");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS oracle audit (c): pure thinking stream with reasoning > output returns n/a ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-oracle-c" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 73_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 73_002_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t1" } });
+    fakeNow = 73_003_000;
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t2" } });
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 50, reasoning: 80 } },
+    });
+    assert.equal(
+      computeTurnTps(
+        { firstThinkingAt: 2000, lastDeltaAt: 3000, doneAt: 3000 },
+        { role: "assistant", usage: { output: 50, reasoning: 80 } },
+      ),
+      null,
+      "pure thinking stream with reasoning > output is not visible and must return null",
+    );
+    assert.match(footerComponent.render(200)[0], /▸ n\/a/, "pure thinking stream with reasoning > output must render n/a");
+    ok("TPS oracle (c): pure thinking stream with reasoning > output renders n/a");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// ── TPS oracle audit (d): 20x guard uses (firstText - firstAny) rather than (firstText - firstThinking) + magpie decodeOf differential check ──
+{
+  let footerComponent = null;
+  const ctx = mockContext({
+    mode: "tui",
+    model: { name: "tps-oracle-d" },
+    getContextUsage: () => ({ tokens: 1000, contextWindow: 10000, percent: 10 }),
+    ui: {
+      notify() {},
+      setFooter(factory) {
+        if (typeof factory === "function") {
+          footerComponent = factory(
+            { requestRender: () => {} },
+            { fg: (_s, t) => t },
+            { getExtensionStatuses: () => new Map() },
+          );
+        }
+      },
+    },
+  });
+
+  const realNow = Date.now;
+  let fakeNow = 74_000_000;
+  Date.now = () => fakeNow;
+  try {
+    const { ext } = await fresh(ctx);
+    // First content is text (firstAny = firstText = 1000), thinking starts at 1500, stream ends at 1600:
+    // (firstText - firstAny) = 0 -> 20x guard lhs is 0 <= 20 * think * w -> passes (166.7 t/s)
+    await fire(ext, "before_provider_request", ctx, { payload: {} });
+    fakeNow = 74_001_000; // firstAny = firstText = 1000
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "text_delta", delta: "a" } });
+    fakeNow = 74_001_500; // firstThinking = 1500
+    await fire(ext, "message_update", ctx, { assistantMessageEvent: { type: "thinking_delta", delta: "t" } });
+    fakeNow = 74_001_600; // end = 1600, w = 600ms, flow = 500ms (flow*4 = 2000 >= 600)
+    await fire(ext, "message_end", ctx, { message: { role: "assistant" } });
+    await fire(ext, "turn_end", ctx, {
+      message: { role: "assistant", usage: { input: 50, output: 101, reasoning: 1 } },
+    });
+    assert.match(
+      footerComponent.render(200)[0],
+      /▸ 166\.7 t\/s/,
+      "when firstAny == firstText == 1000 and firstThinking == 1500, (firstText - firstAny) == 0 so 20x guard passes (166.7 t/s)",
+    );
+
+    // Reference implementation copied verbatim from magpie binary decodeOf (offset 28711427):
+    const reasoningOf = (r) => r.think ?? 0;
+    function decodeOfRef(r) {
+      const { ttft, firstReasoning, firstText, flow, ms } = r;
+      const think = reasoningOf(r), visible = think > 0 && !(firstText > 0) && firstReasoning >= ttft && flow > 0 && think <= r.out;
+      const n = think > 0 && !visible ? r.out - think : r.out,
+            from = visible ? firstReasoning : think > 0 ? firstText : ttft;
+      const w = ms - from;
+      if (!(n > 0 && ttft > 0 && from > 0 && w >= 100 && n * 1000 <= 10000 * w)) return null;
+      if (flow > 0 && flow * 4 < w) return null;
+      if (think > 0 && firstText > 0 && n * (firstText - ttft) > 20 * think * w) return null;
+      return formatTps(n, w);
+    }
+
+    const differentialSamples = [
+      // 1. magpie S1: thinking + text split -> 90.8
+      { name: "S1", firstThinkingAt: 6402, firstTextAt: 8240, lastDeltaAt: 18065, doneAt: 17575, out: 989, think: 141 },
+      // 2. magpie S2: thinking + text split -> 137.6
+      { name: "S2", firstThinkingAt: 5504, firstTextAt: 11989, lastDeltaAt: 12694, doneAt: 12694, out: 467, think: 370 },
+      // 3. magpie S3: text only, think=0 -> 71.3
+      { name: "S3", firstThinkingAt: null, firstTextAt: 6418, lastDeltaAt: 18118, doneAt: 18118, out: 834, think: 0 },
+      // 4. pure thinking visible (think <= out) -> 80
+      { name: "pure-thinking-visible", firstThinkingAt: 2000, firstTextAt: null, lastDeltaAt: 3000, doneAt: 3000, out: 80, think: 80 },
+      // 5. oracle a: reasoning == output with text stream -> null
+      { name: "oracle-a-equal-reasoning-out", firstThinkingAt: 1000, firstTextAt: 2000, lastDeltaAt: 3000, doneAt: 3000, out: 100, think: 100 },
+      // 6. oracle b: interleaved text before thinking -> 75
+      { name: "oracle-b-text-before-thinking", firstThinkingAt: 3000, firstTextAt: 2000, lastDeltaAt: 3000, doneAt: 4000, out: 200, think: 50 },
+      // 7. oracle c: pure thinking reasoning > output -> null
+      { name: "oracle-c-pure-thinking-exceeds-out", firstThinkingAt: 2000, firstTextAt: null, lastDeltaAt: 3000, doneAt: 3000, out: 50, think: 80 },
+      // 8. oracle d / 20x guard breach: n * (firstText - ttft) > 20 * think * w -> null
+      { name: "guard-20x-breach", firstThinkingAt: 1000, firstTextAt: 2000, lastDeltaAt: 2100, doneAt: 2100, out: 510, think: 10 },
+      // 9. oracle d / interleaved firstAny=firstText=1000, firstThinking=1500 -> 166.7
+      { name: "oracle-d-interleaved-denom", firstThinkingAt: 1500, firstTextAt: 1000, lastDeltaAt: 1500, doneAt: 1600, out: 101, think: 1 },
+    ];
+
+    for (const s of differentialSamples) {
+      const ttft = s.firstThinkingAt !== null && s.firstTextAt !== null
+        ? Math.min(s.firstThinkingAt, s.firstTextAt)
+        : (s.firstThinkingAt ?? s.firstTextAt ?? 0);
+      const ms = s.doneAt ?? s.lastDeltaAt;
+      const flow = (s.lastDeltaAt ?? ms) - ttft;
+      const expected = decodeOfRef({
+        ttft,
+        firstReasoning: s.firstThinkingAt ?? 0,
+        firstText: s.firstTextAt ?? 0,
+        flow,
+        ms,
+        out: s.out,
+        think: s.think,
+      });
+      const actual = computeTurnTps(
+        {
+          firstThinkingAt: s.firstThinkingAt,
+          firstTextAt: s.firstTextAt,
+          lastDeltaAt: s.lastDeltaAt,
+          doneAt: s.doneAt,
+        },
+        { role: "assistant", usage: { output: s.out, reasoning: s.think } },
+      );
+      assert.equal(actual, expected, `differential mismatch on ${s.name}: actual=${actual} vs decodeOf=${expected}`);
+    }
+
+    ok("TPS oracle (d): 20x guard uses (firstText - firstAny) and computeTurnTps matches magpie decodeOf across 9 samples");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+console.log(`All cache-stats regressions passed (${passed} cases, sdk=${sdkVersion})`);

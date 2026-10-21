@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const GUARDIAN_PATH = path.join(REPO_ROOT, "extensions", "cache-stats.ts");
+export const CACHE_STATS_PATH = path.join(REPO_ROOT, "extensions", "cache-stats.ts");
 
 /** Drop inherited PI_CACHE_* flags without losing the explicit SDK adapter. */
 export function isolateCacheEnv() {
@@ -92,7 +92,7 @@ export function mockContext(overrides = {}) {
   return ctx;
 }
 
-export function registerFactory(factory, name = "guardian") {
+export function registerFactory(factory, name = "cache-stats") {
   const handlers = new Map();
   const commands = new Map();
   factory({
@@ -103,7 +103,7 @@ export function registerFactory(factory, name = "guardian") {
 }
 
 export function runnerFor(ExtensionRunner, exts, ctx) {
-  const runner = new ExtensionRunner(exts, { assertActive() {} }, "/tmp/guardian-fix-cwd", ctx.sessionManager, {});
+  const runner = new ExtensionRunner(exts, { assertActive() {} }, "/tmp/cache-stats-fix-cwd", ctx.sessionManager, {});
   runner.createContext = () => ctx;
   runner.emitError = (e) => {
     throw new Error(JSON.stringify(e));
@@ -118,6 +118,6 @@ export async function fire(ext, event, ctx, data = {}) {
 }
 
 export async function promptThrough(runner, base, options = {}) {
-  const r = await runner.emitBeforeAgentStart("offline-test", undefined, base, { cwd: "/tmp/guardian-fix-cwd", ...options });
+  const r = await runner.emitBeforeAgentStart("offline-test", undefined, base, { cwd: "/tmp/cache-stats-fix-cwd", ...options });
   return r?.systemPrompt ?? base;
 }

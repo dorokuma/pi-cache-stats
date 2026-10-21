@@ -8,7 +8,7 @@ import { loadSdk, promptThrough, registerFactory, runnerFor, isolateCacheEnv } f
 isolateCacheEnv();
 process.env.PI_CACHE_STATS_FOOTER = "0";
 
-const { default: guardianFactory } = await import("../extensions/cache-stats.ts");
+const { default: cacheStatsFactory } = await import("../extensions/cache-stats.ts");
 const loaded = await loadSdk();
 const {
   ExtensionRunner,
@@ -29,7 +29,7 @@ globalThis.fetch = async (..._args) => {
   throw new Error("TEST_NETWORK_FORBIDDEN");
 };
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "guardian-fix-session-"));
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cache-stats-fix-session-"));
 const cwd = path.join(tmp, "cwd");
 const agentDir = path.join(tmp, "agent");
 fs.mkdirSync(cwd, { recursive: true });
@@ -77,7 +77,7 @@ const loader = new DefaultResourceLoader({
   cwd,
   agentDir,
   settingsManager,
-  extensionFactories: [guardianFactory, recorder],
+  extensionFactories: [cacheStatsFactory, recorder],
   noExtensions: true,
   noSkills: true,
   noPromptTemplates: true,
@@ -145,7 +145,7 @@ try {
   );
   console.log("PASS host AgentSession setActiveToolsByName rebuilds system prompt");
 
-  const ext = registerFactory(guardianFactory, "guardian-from-host-prompts");
+  const ext = registerFactory(cacheStatsFactory, "cache-stats-from-host-prompts");
   const ctx = {
     mode: "print",
     thinkingLevel: "off",

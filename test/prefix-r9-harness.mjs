@@ -1,7 +1,7 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
-  GUARDIAN_PATH,
+  CACHE_STATS_PATH,
   fire,
   loadSdk,
   mockContext,
@@ -26,7 +26,7 @@ export const SENTINEL = {
 
 export function resolveCorePath() {
   const explicit = process.env.PI_CACHE_STATS_CORE;
-  return explicit ? path.resolve(explicit) : GUARDIAN_PATH;
+  return explicit ? path.resolve(explicit) : CACHE_STATS_PATH;
 }
 
 export async function loadUnderTest() {
@@ -41,7 +41,7 @@ export async function loadUnderTest() {
   return { guardianFactory, loaded, corePath, href };
 }
 
-export async function fresh(ExtensionRunner, factory, ctx = mockContext(), name = "guardian") {
+export async function fresh(ExtensionRunner, factory, ctx = mockContext(), name = "cache-stats") {
   const ext = registerFactory(factory, name);
   const runner = runnerFor(ExtensionRunner, [ext], ctx);
   await fire(ext, "session_start", ctx);

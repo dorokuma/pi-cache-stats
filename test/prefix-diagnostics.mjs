@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { pathToFileURL } from "node:url";
 import {
-  GUARDIAN_PATH,
+  CACHE_STATS_PATH,
   fire,
   loadSdk,
   mockContext,
@@ -13,9 +13,9 @@ import {
 
 isolateCacheEnv();
 
-const guardianHref = pathToFileURL(GUARDIAN_PATH).href;
+const guardianHref = pathToFileURL(CACHE_STATS_PATH).href;
 console.log(`guardian import: ${guardianHref}`);
-console.log(`guardian path: ${GUARDIAN_PATH}`);
+console.log(`guardian path: ${CACHE_STATS_PATH}`);
 
 const { default: guardianFactory } = await import(guardianHref);
 const loaded = await loadSdk();
@@ -39,7 +39,7 @@ function ok(name) {
   console.log(`PASS ${name}`);
 }
 
-async function fresh(ctx = mockContext(), factory = guardianFactory, name = "guardian") {
+async function fresh(ctx = mockContext(), factory = guardianFactory, name = "cache-stats") {
   const ext = registerFactory(factory, name);
   const runner = runnerFor(ExtensionRunner, [ext], ctx);
   await fire(ext, "session_start", ctx);

@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
-  GUARDIAN_PATH,
+  CACHE_STATS_PATH,
   fire,
   loadSdk,
   mockContext,
@@ -25,7 +25,7 @@ function ok(name) {
   console.log(`PASS ${name}`);
 }
 
-async function fresh(ctx = mockContext(), factory = guardianFactory, name = "guardian") {
+async function fresh(ctx = mockContext(), factory = guardianFactory, name = "cache-stats") {
   const ext = registerFactory(factory, name);
   const runner = runnerFor(ExtensionRunner, [ext], ctx);
   await fire(ext, "session_start", ctx);
@@ -36,7 +36,7 @@ async function fresh(ctx = mockContext(), factory = guardianFactory, name = "gua
 {
   const script = `
     process.env.PI_CACHE_RETENTION = "short";
-    const { cacheHitPct } = await import(${JSON.stringify(pathToFileURL(GUARDIAN_PATH).href)});
+    const { cacheHitPct } = await import(${JSON.stringify(pathToFileURL(CACHE_STATS_PATH).href)});
     if (process.env.PI_CACHE_RETENTION !== "short") {
       console.error("mutated", process.env.PI_CACHE_RETENTION);
       process.exit(1);

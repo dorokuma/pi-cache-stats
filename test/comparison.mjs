@@ -20,7 +20,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { GUARDIAN_PATH, loadSdk, isolateCacheEnv } from "./helpers.mjs";
+import { CACHE_STATS_PATH, loadSdk, isolateCacheEnv } from "./helpers.mjs";
 
 isolateCacheEnv();
 
@@ -128,7 +128,7 @@ function print(label, results) {
 }
 
 async function runOfflineSelfCheck() {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "guardian-fix-cmp-"));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cache-stats-fix-cmp-"));
   const cwd = path.join(tmp, "cwd");
   const agentDir = path.join(tmp, "agent");
   fs.mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
@@ -268,8 +268,8 @@ async function runNetworkBench() {
   if (!agentDir) {
     throw new Error("PI_CACHE_STATS_BENCH=1 requires PI_CACHE_STATS_BENCH_AGENT_DIR (explicit, never default ~/.pi/agent)");
   }
-  const cwd = process.env.PI_CACHE_STATS_BENCH_CWD ?? fs.mkdtempSync(path.join(os.tmpdir(), "guardian-fix-bench-"));
-  const { default: extFactory } = await import(pathToFileURL(GUARDIAN_PATH).href);
+  const cwd = process.env.PI_CACHE_STATS_BENCH_CWD ?? fs.mkdtempSync(path.join(os.tmpdir(), "cache-stats-fix-bench-"));
+  const { default: extFactory } = await import(pathToFileURL(CACHE_STATS_PATH).href);
   const modelRuntime = await ModelRuntime.create({
     authPath: path.join(agentDir, "auth.json"),
     modelsPath: path.join(agentDir, "models.json"),

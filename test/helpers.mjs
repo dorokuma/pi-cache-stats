@@ -1,3 +1,4 @@
+import "./sdk-loader.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -5,15 +6,17 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const CACHE_STATS_PATH = path.join(REPO_ROOT, "extensions", "cache-stats.ts");
 
-/** Drop inherited PI_CACHE_* flags without losing the explicit SDK adapter. */
+/** Drop inherited PI_CACHE_* flags without losing the explicit SDK/TUI adapters. */
 export function isolateCacheEnv() {
   const testSdk = process.env.PI_CACHE_STATS_TEST_SDK;
+  const testTui = process.env.PI_CACHE_STATS_TEST_TUI;
   const bench = {};
   for (const k of Object.keys(process.env)) {
     if (k.startsWith("PI_CACHE_STATS_BENCH")) bench[k] = process.env[k];
     if (k.startsWith("PI_CACHE")) delete process.env[k];
   }
   if (testSdk) process.env.PI_CACHE_STATS_TEST_SDK = testSdk;
+  if (testTui) process.env.PI_CACHE_STATS_TEST_TUI = testTui;
   Object.assign(process.env, bench);
 }
 

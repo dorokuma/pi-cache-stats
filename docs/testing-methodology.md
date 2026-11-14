@@ -2,9 +2,9 @@
 
 ## 目的
 
-验证 cache-stats **不会**为了缓存而丢弃新的系统规则或破坏来源边界，并确认统计口径、启停生命周期和对照脚本隔离。量化“更长缓存前缀 / 更低账单”需要显式网络基准，**不是** `npm test` 的一部分。
+验证 cache-stats **不会**为了缓存而丢弃新的系统规则或破坏来源边界，并确认统计口径、启停生命周期和对照脚本隔离。量化“更长缓存前缀 / 更低账单”需要显式网络基准，**不是** `make check` 的一部分。
 
-## 离线回归（`npm test`）
+## 离线回归（`make check`）
 
 | 文件 | 覆盖 |
 |------|------|
@@ -30,10 +30,11 @@
 
 SDK 选择：
 
-- 默认：项目依赖 `@earendil-works/pi-coding-agent`（当前 0.84.2）
-- 显式：`PI_CACHE_STATS_TEST_SDK=/path/to/package-or-dist`（例如本机 0.85.1 宿主包）。测试不写死本机绝对路径。
+- 干净克隆不含 `node_modules`（本仓不随附 package.json / pnpm-lock.yaml）：必须通过 `PI_CACHE_STATS_TEST_SDK=/path/to/@earendil-works/pi-coding-agent` 指定宿主 SDK（包目录或其 `dist/` 目录均可），否则 `make check` 的前置契约检查直接失败。`test/sdk-loader.mjs` 用 Node 22 `registerHooks` 把裸导入映射到该 SDK，并自动解析其同级 `@earendil-works/pi-tui`（可用 `PI_CACHE_STATS_TEST_TUI` 单独覆盖）。
+- 已有 `node_modules` 的工作副本可不设 `PI_CACHE_STATS_TEST_SDK`，钩子透传默认解析。
+- 已验证兼容 SDK 0.84.2 / 0.85.1。测试不写死本机绝对路径。
 
-`npm test` 不读取 `~/.pi/agent`、不使用用户凭证、不调用真实模型 API。
+`make check` 不读取 `~/.pi/agent`、不使用用户凭证、不调用真实模型 API。
 
 ## 宿主可达性（F01）
 

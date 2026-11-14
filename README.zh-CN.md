@@ -70,23 +70,17 @@ Pi Agent 的事件系统与扩展 API 已经可用。服务端缓存仍取决于
 
 ## 安装
 
-### npm（推荐）
+> **说明：** 本仓库的 TypeScript 扩展已由 `pi-extensions/go/cache-stats` 接替，不再发布 npm 包。
 
-```bash
-pi install npm:pi-cache-stats
-```
-
-Pi 自动安装并加载，无需设置变更。
-
-### 直接复制
+克隆仓库后执行安装脚本：
 
 ```bash
 git clone https://github.com/dorokuma/pi-cache-stats.git
 cd pi-cache-stats
-bash integrations/pi/install.sh   # 或：pnpm sync
+bash integrations/pi/install.sh
 ```
 
-`install.sh` 幂等：部署副本与仓库源 md5 一致时报告 `unchanged`，不重写目标（mtime 不变）。失败显式而非静默：`md5sum` 缺失、`HOME` 未设置（仅在未指定 `PI_EXT_DEST` 时校验）、目标非绝对路径或为目录，均向 stderr 打印 `install.sh FAILED: ...` 并非零退出。目标可用 `PI_EXT_DEST=/abs/path/to/cache-stats.ts` 覆盖。pi 仅在会话启动时加载扩展——之后需 `/reload` 或新会话生效。本脚本只覆盖「仓库源文件 → 本机扩展目录」这条链路；上方的 `pi install npm:pi-cache-stats` 装的是 npm 发布版，不经此脚本。
+`install.sh` 幂等：部署副本与仓库源 md5 一致时报告 `unchanged`，不重写目标（mtime 不变）。失败显式而非静默：`md5sum` 缺失、`HOME` 未设置（仅在未指定 `PI_EXT_DEST` 时校验）、目标非绝对路径或为目录，均向 stderr 打印 `install.sh FAILED: ...` 并非零退出。目标可用 `PI_EXT_DEST=/abs/path/to/cache-stats.ts` 覆盖。pi 仅在会话启动时加载扩展——之后需 `/reload` 或新会话生效。
 
 ### 环境变量
 
@@ -111,18 +105,20 @@ bash integrations/pi/install.sh   # 或：pnpm sync
 ## 测试
 
 ```bash
-npm test
+make check
 ```
 
-`npm test` 完全离线：加载被测扩展、驱动 Pi 事件、跑隔离的 AgentSession 工具集路径，并自检 comparison 辅助逻辑。不读取 `~/.pi/agent`、用户凭证，也不调用模型 API。
+`make check` 完全离线：先对扩展执行 `node --check`，再串行跑全部 19 个测试——加载被测扩展、驱动 Pi 事件、跑隔离的 AgentSession 工具集路径，并自检 comparison 辅助逻辑。不读取 `~/.pi/agent`、用户凭证，也不调用模型 API。
 
-若要测本机宿主 SDK 而不是项目锁定的 0.84.2：
+干净克隆不含 `node_modules`（本仓不随附 package.json / pnpm-lock.yaml），需为 `make check` 指定宿主 SDK（包目录或其 `dist/` 目录均可）：
 
 ```bash
-PI_CACHE_STATS_TEST_SDK=/path/to/@earendil-works/pi-coding-agent npm test
+PI_CACHE_STATS_TEST_SDK=/path/to/@earendil-works/pi-coding-agent make check
 ```
 
-真实网络 A/B **必须显式选择**（不在 `npm test` 中）：
+`test/sdk-loader.mjs` 会把裸导入映射到该 SDK，并自动解析同级 `@earendil-works/pi-tui`（可用 `PI_CACHE_STATS_TEST_TUI` 单独覆盖）；已有 `node_modules` 的工作副本可不设该变量。已验证兼容 SDK 0.84.2 / 0.85.1。
+
+真实网络 A/B **必须显式选择**（不在 `make check` 中）：
 
 ```bash
 PI_CACHE_STATS_BENCH=1 \

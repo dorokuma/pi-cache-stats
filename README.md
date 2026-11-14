@@ -70,23 +70,17 @@ When running in TUI mode, the footer renders stats calculated in real time at re
 
 ## Install
 
-### npm (recommended)
+> **Note:** This repository's TypeScript extension has been superseded by `pi-extensions/go/cache-stats` and is no longer published to npm.
 
-```bash
-pi install npm:pi-cache-stats
-```
-
-Pi auto-installs and loads it. No settings changes required.
-
-### Direct copy
+Clone the repository and run the install script:
 
 ```bash
 git clone https://github.com/dorokuma/pi-cache-stats.git
 cd pi-cache-stats
-bash integrations/pi/install.sh   # or: pnpm sync
+bash integrations/pi/install.sh
 ```
 
-`install.sh` is idempotent: when the deployed copy already matches the repo source (md5), it reports `unchanged` and does not rewrite the target (mtime untouched). It fails loudly instead of silently: a missing `md5sum`, an unset `HOME` (only when `PI_EXT_DEST` is not given), or a non-absolute / directory destination all print `install.sh FAILED: ...` to stderr and exit non-zero. Override the destination with `PI_EXT_DEST=/abs/path/to/cache-stats.ts`. Pi loads extensions at session start — run `/reload` or start a new session afterwards. This script only syncs the repo source into the local extension directory; the npm route above (`pi install npm:pi-cache-stats`) installs the published package and does not go through this script.
+`install.sh` is idempotent: when the deployed copy already matches the repo source (md5), it reports `unchanged` and does not rewrite the target (mtime untouched). It fails loudly instead of silently: a missing `md5sum`, an unset `HOME` (only when `PI_EXT_DEST` is not given), or a non-absolute / directory destination all print `install.sh FAILED: ...` to stderr and exit non-zero. Override the destination with `PI_EXT_DEST=/abs/path/to/cache-stats.ts`. Pi loads extensions at session start — run `/reload` or start a new session afterwards.
 
 ### Environment variables
 
@@ -111,18 +105,20 @@ bash integrations/pi/install.sh   # or: pnpm sync
 ## Tests
 
 ```bash
-npm test
+make check
 ```
 
-`npm test` is offline: it loads the extension, drives Pi events, runs an isolated AgentSession tool-set path, and self-checks comparison helpers. It does not read `~/.pi/agent`, user credentials, or call a model API.
+`make check` is offline: it runs `node --check` on the extension, then all 19 test suites serially — loading the extension, driving Pi events, running an isolated AgentSession tool-set path, and self-checking comparison helpers. It does not read `~/.pi/agent`, user credentials, or call a model API.
 
-To exercise the host SDK instead of the project pin (0.84.2):
+A clean clone carries no `node_modules` (no package.json / pnpm-lock.yaml). Point `make check` at a host SDK — the package directory or its `dist/` directory:
 
 ```bash
-PI_CACHE_STATS_TEST_SDK=/path/to/@earendil-works/pi-coding-agent npm test
+PI_CACHE_STATS_TEST_SDK=/path/to/@earendil-works/pi-coding-agent make check
 ```
 
-A real network A/B is **opt-in only** (never part of `npm test`):
+`test/sdk-loader.mjs` maps bare imports onto that SDK and auto-resolves its sibling `@earendil-works/pi-tui` (override with `PI_CACHE_STATS_TEST_TUI`). A checkout that already has `node_modules` can run `make check` without the variable. Verified SDK compatibility: 0.84.2 / 0.85.1.
+
+A real network A/B is **opt-in only** (never part of `make check`):
 
 ```bash
 PI_CACHE_STATS_BENCH=1 \
@@ -139,14 +135,4 @@ See [docs/testing-methodology.md](./docs/testing-methodology.md) and [docs/audit
 - OpenAI Prompt caching: prefix matching, routing keys, retention, and cost
 - Anthropic Prompt caching: cache blocks, TTL, cost, and order constraints
 - DeepSeek Context caching: automatic prefix caching (best-effort)
-
-## Commit conventions
-
-Commit messages must follow Conventional Commits (`TYPE: subject` or `TYPE(scope): subject`):
-
-- **Types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
-- **Scope**: Optional (`[a-z0-9._-]+`)
-- **Subject**: Non-empty, ≤ 72 characters (supports mixed English and Chinese)
-- **Exemptions**: Merge, revert, `fixup!`, and `squash!` commits
-- **Validation**: Enforced locally by the `commit-msg` hook with secret scanning and noise-word checks.
 

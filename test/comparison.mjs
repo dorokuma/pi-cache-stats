@@ -1,7 +1,7 @@
 /**
  * Isolated A/B comparison helpers and offline self-check.
  *
- * Default (`npm test`): fully offline. Does not load ~/.pi/agent, user
+ * Default (`make check`): fully offline. Does not load ~/.pi/agent, user
  * extensions, credentials, or call a model API.
  *
  * Real network benchmark (optional, explicit):

@@ -5,7 +5,7 @@
 # 先备份成 .bak-<时间戳> 再覆盖），没有任何机制保证同步被执行；更名 cache-stats
 # 前遗留的旧扩展与历史 .bak-* 残留若留在部署目录，还会被 Pi 扩展发现规则重复加载。
 # 本脚本把同步与旧版残留清理收成一个可单独执行验证的入口：
-#   integrations/pi/install.sh      # 或 pnpm sync
+#   integrations/pi/install.sh
 #
 # DEST 语义定稿：目标是一个「文件路径」（~/.pi/agent/extensions/
 # cache-stats.ts），不接受目录——指向已存在目录时显式失败，不静默补全
